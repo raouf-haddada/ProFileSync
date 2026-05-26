@@ -24,24 +24,71 @@
 #                       Default: --pick when stdin is a TTY and whiptail exists.
 #   help                Show this help.
 #
-# Config files (first found wins):
+# Service (autobackup) — run as root:
+#   install [opts]      Install systemd timer + write /etc/profilesync.conf.
+#                         --remote URL     git remote (default: this repo's origin)
+#                         --ssh-key PATH   repo SSH key (default: autodetect)
+#                         --user NAME      whose home to back up (default: $SUDO_USER)
+#                         --repo-dir DIR   service clone (default: /var/lib/profilesync/repo)
+#                         --schedule S     daily|hourly|weekly (default: daily)
+#                         --extra-dir DIR  extra path to back up (repeatable)
+#   uninstall [--purge] Remove the timer/units (+ conf & repo with --purge).
+#   set-passphrase      Re-encrypt the backup passphrase into the conf.
+#   show-config         Print /etc/profilesync.conf (passphrase masked).
+#
+# Machine config (/etc/profilesync.conf, sourced if present):
+#   GIT_REMOTE, SSH_KEY, REPO_DIR, BACKUP_USER, BRANCH, EXTRA_DIRS, PASSPHRASE_ENC
+#   The passphrase is encrypted with AES-256 keyed on sha256(SSH_KEY file), so
+#   the same SSH key that reaches the repo also unlocks the passphrase. The
+#   service decrypts it unattended; restore on another machine with the same key
+#   works identically.
+#
+# Per-user config files (first found wins):
 #   $HOME/.config/profilesync/paths.conf      what to back up
 #   $HOME/.config/profilesync/excludes.conf   tar globs to skip
 #   (repo) config/paths.conf, config/excludes.conf
 #   (repo) config/*.example   templates
 #
 # Env overrides:
-#   $PROFILESYNC_PASSPHRASE   passphrase (else prompted)
+#   $PROFILESYNC_PASSPHRASE   passphrase (else from conf, else prompted)
 #   $PROFILESYNC_BRANCH       override the machine branch name entirely
+#   $PROFILESYNC_CONF         alternate machine config path
 #
 # Reading /etc and restoring system files requires sudo; the script will prompt
 # for it only when needed.
 
 set -euo pipefail
 
-# --- Resolve repo root (script lives in <repo>/bin) -----------------------
+# --- Machine config (/etc/profilesync.conf) ------------------------------
+# Sourced early so it can set BACKUP_USER (→ HOME/USER), REPO_DIR, GIT_REMOTE,
+# SSH_KEY, BRANCH, EXTRA_DIRS and the encrypted PASSPHRASE_ENC. It's a
+# root-owned KEY="VALUE" shell fragment; sourcing is intentional.
+CONF_FILE="${PROFILESYNC_CONF:-/etc/profilesync.conf}"
+if [[ -r "$CONF_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+fi
+
+# BACKUP_USER makes a root service expand $HOME/$USER to that user's dotfiles.
+if [[ -n "${BACKUP_USER:-}" ]]; then
+  _bu_home="$(getent passwd "$BACKUP_USER" | cut -d: -f6)"
+  [[ -n "$_bu_home" ]] && export HOME="$_bu_home"
+  export USER="$BACKUP_USER"
+fi
+
+# --- Resolve repo root ---------------------------------------------------
+# When run from inside a clone (<repo>/bin/profilesync, dev), use that clone so
+# local iteration ignores any installed conf. Otherwise (installed binary at
+# /usr/local/bin) use REPO_DIR from the machine config.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+_script_repo="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+if git -C "$_script_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  REPO_ROOT="$_script_repo"
+elif [[ -n "${REPO_DIR:-}" ]]; then
+  REPO_ROOT="$REPO_DIR"
+else
+  REPO_ROOT="$_script_repo"
+fi
 DATA_DIR="$REPO_ROOT/data"
 REPO_CONF="$REPO_ROOT/config/paths.conf"
 REPO_CONF_EXAMPLE="$REPO_ROOT/config/paths.conf.example"
@@ -50,11 +97,21 @@ REPO_EXCLUDES_EXAMPLE="$REPO_ROOT/config/excludes.conf.example"
 USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/paths.conf"
 USER_EXCLUDES="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/excludes.conf"
 
+# Use the repo's SSH key for all git transport when configured.
+if [[ -n "${SSH_KEY:-}" ]]; then
+  export GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+fi
+
+# Branch override from conf (explicit env still wins).
+if [[ -n "${BRANCH:-}" && -z "${PROFILESYNC_BRANCH:-}" ]]; then
+  PROFILESYNC_BRANCH="$BRANCH"
+fi
+
 # Auto-split threshold (bytes). GitHub warns over 50MB and rejects over 100MB.
 SPLIT_THRESHOLD=$((45 * 1024 * 1024))
 SPLIT_CHUNK="45M"
 
-mkdir -p "$DATA_DIR"
+mkdir -p "$DATA_DIR" 2>/dev/null || true
 
 # --- Logging -------------------------------------------------------------
 log()  { printf '\033[1;34m[profilesync]\033[0m %s\n' "$*" >&2; }
@@ -138,7 +195,9 @@ machine_branch() {
     return
   fi
   local h id
-  h="$(hostname -s | tr -c 'A-Za-z0-9_.-' '-')"
+  h="$(hostname -s)"
+  # Sanitize without letting the trailing newline become a stray '-'.
+  h="$(printf '%s' "$h" | tr -c 'A-Za-z0-9_.-' '-')"
   id="$(machine_id)"
   printf 'backup/%s-%s' "$h" "${id:0:12}"
 }
@@ -161,6 +220,11 @@ commit_to_branch() {
   local f blob mode tree commit
   (
     export GIT_INDEX_FILE="$tmpindex"
+    # Explicit identity so commits work even with no gitconfig (root service).
+    export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-profilesync}"
+    export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-profilesync@$(hostname -s)}"
+    export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+    export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
     cd "$REPO_ROOT"
     for f in "$@"; do
       blob="$(git hash-object -w -- "$f")"
@@ -178,12 +242,39 @@ commit_to_branch() {
   rm -f "$tmpindex"
 }
 
+# --- Passphrase-at-rest crypto (keyed on the repo SSH private key) --------
+# The symmetric key is sha256(private key file). Whoever holds the same SSH
+# key (needed for repo access anyway) can decrypt the stored passphrase, so a
+# leaked /etc/profilesync.conf alone never reveals it.
+pass_key() {
+  local key="${SSH_KEY:-}"
+  [[ -n "$key" ]] || die "SSH_KEY not set (needed for passphrase encryption)"
+  [[ -r "$key" ]] || die "SSH key not readable: $key"
+  sha256sum -- "$key" | awk '{print $1}'
+}
+
+encrypt_passphrase() {  # plaintext on stdin → base64 ciphertext on stdout
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass "pass:$(pass_key)" | base64 -w0
+}
+
+decrypt_passphrase() {  # uses $PASSPHRASE_ENC → plaintext on stdout
+  printf '%s' "$PASSPHRASE_ENC" | base64 -d \
+    | openssl enc -d -aes-256-cbc -pbkdf2 -pass "pass:$(pass_key)"
+}
+
 # --- Passphrase ----------------------------------------------------------
 get_passphrase() {
+  # 1) explicit env var
   if [[ -n "${PROFILESYNC_PASSPHRASE:-}" ]]; then
     printf '%s' "$PROFILESYNC_PASSPHRASE"
     return
   fi
+  # 2) encrypted passphrase from machine config (unattended/service use)
+  if [[ -n "${PASSPHRASE_ENC:-}" && -n "${SSH_KEY:-}" ]]; then
+    decrypt_passphrase || die "failed to decrypt stored passphrase (wrong SSH key?)"
+    return
+  fi
+  # 3) interactive prompt
   local p1 p2
   read -r -s -p "Passphrase: " p1 </dev/tty; echo >&2
   if [[ "${1:-}" == "confirm" ]]; then
@@ -261,6 +352,21 @@ cmd_backup() {
       user_paths+=("$p")
     fi
   done < <(read_paths "$conf")
+
+  # Machine-specific EXTRA_DIRS from /etc/profilesync.conf (space/newline/colon
+  # separated absolute paths). Appended to whatever paths.conf resolved.
+  if [[ -n "${EXTRA_DIRS:-}" ]]; then
+    local ed
+    for ed in ${EXTRA_DIRS//:/ }; do
+      [[ -z "$ed" ]] && continue
+      if [[ "$ed" == /etc/* ]] || [[ "$ed" == /etc ]]; then
+        etc_paths+=("$ed")
+      else
+        user_paths+=("$ed")
+      fi
+    done
+    log "added $(printf '%s\n' ${EXTRA_DIRS//:/ } | grep -c .) extra dir(s) from $CONF_FILE"
+  fi
 
   local ts host outfile workdir
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -652,19 +758,227 @@ pick_entries() {
   [[ -s "$out" ]]
 }
 
+# --- Service install / config -------------------------------------------
+
+require_root() {
+  [[ "$(id -u)" -eq 0 ]] || die "this command must be run as root (try: sudo $0 $SUBCMD ...)"
+}
+
+# Detect the SSH private key used for a git remote host (best effort).
+detect_ssh_key() {
+  local remote="$1" host key
+  host="$(printf '%s' "$remote" | sed -n 's/.*@\([^:/]*\).*/\1/p')"
+  [[ -z "$host" ]] && host=github.com
+  key="$(ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2; exit}')"
+  # ssh -G prints ~-relative; expand.
+  key="${key/#\~/$HOME}"
+  if [[ -n "$key" && -r "$key" ]]; then printf '%s' "$key"; return; fi
+  local k
+  for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" /root/.ssh/id_ed25519 /root/.ssh/id_rsa; do
+    [[ -r "$k" ]] && { printf '%s' "$k"; return; }
+  done
+}
+
+cmd_install() {
+  require_root
+  local remote="" ssh_key="" bkuser="${SUDO_USER:-}" repodir="/var/lib/profilesync/repo"
+  local schedule="daily" bindst="/usr/local/bin/profilesync"
+  local extra=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remote)    remote="$2"; shift 2 ;;
+      --ssh-key)   ssh_key="$2"; shift 2 ;;
+      --user)      bkuser="$2"; shift 2 ;;
+      --repo-dir)  repodir="$2"; shift 2 ;;
+      --schedule)  schedule="$2"; shift 2 ;;
+      --extra-dir) extra+=("$2"); shift 2 ;;
+      --bin)       bindst="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  [[ -n "$bkuser" ]] || die "could not determine backup user — pass --user <name>"
+  local bkhome; bkhome="$(getent passwd "$bkuser" | cut -d: -f6)"
+  [[ -n "$bkhome" ]] || die "no home dir for user: $bkuser"
+
+  # Remote: flag, else this repo's origin, else error.
+  if [[ -z "$remote" ]]; then
+    remote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  fi
+  [[ -n "$remote" ]] || die "no git remote — pass --remote git@host:org/repo.git"
+
+  # SSH key: flag, else autodetect for the remote host (search as $bkuser).
+  if [[ -z "$ssh_key" ]]; then
+    ssh_key="$(HOME="$bkhome" detect_ssh_key "$remote")"
+  fi
+  [[ -n "$ssh_key" && -r "$ssh_key" ]] || die "SSH key not found/readable — pass --ssh-key <path>"
+  SSH_KEY="$ssh_key"   # so pass_key() works below
+
+  case "$schedule" in daily|hourly|weekly) ;; *) die "schedule must be daily|hourly|weekly" ;; esac
+
+  log "backup user : $bkuser ($bkhome)"
+  log "git remote  : $remote"
+  log "ssh key     : $ssh_key"
+  log "repo dir    : $repodir"
+  log "schedule    : $schedule"
+
+  # Passphrase: env or prompt (confirmed), then encrypt with the SSH key.
+  local plain
+  if [[ -n "${PROFILESYNC_PASSPHRASE:-}" ]]; then
+    plain="$PROFILESYNC_PASSPHRASE"
+  else
+    local p2
+    read -r -s -p "Backup passphrase: " plain </dev/tty; echo >&2
+    read -r -s -p "Confirm:           " p2 </dev/tty; echo >&2
+    [[ "$plain" == "$p2" ]] || die "passphrases do not match"
+  fi
+  [[ -n "$plain" ]] || die "empty passphrase"
+  local enc; enc="$(printf '%s' "$plain" | encrypt_passphrase)"
+
+  # Clone the repo (main) into repodir as the service's working copy.
+  if [[ ! -d "$repodir/.git" ]]; then
+    mkdir -p "$(dirname "$repodir")"
+    log "cloning $remote → $repodir"
+    GIT_SSH_COMMAND="ssh -i $ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+      git clone --branch main "$remote" "$repodir"
+  else
+    log "repo dir already a clone — leaving as is"
+  fi
+
+  # Install the binary.
+  install -m 0755 "${BASH_SOURCE[0]}" "$bindst"
+  log "installed binary → $bindst"
+
+  # Write /etc/profilesync.conf (0600).
+  local extra_str=""
+  if (( ${#extra[@]} > 0 )); then extra_str="${extra[*]}"; fi
+  umask 077
+  cat > "$CONF_FILE" <<EOF
+# profilesync machine config — managed by 'profilesync install'
+# Sourced by the tool; KEY="VALUE" shell syntax.
+
+GIT_REMOTE="$remote"
+SSH_KEY="$ssh_key"
+REPO_DIR="$repodir"
+BACKUP_USER="$bkuser"
+BRANCH=""                       # empty → backup/<host>-<machine-id>
+
+# Passphrase encrypted with AES-256 keyed on sha256("\$SSH_KEY").
+# Re-encode with: profilesync set-passphrase
+PASSPHRASE_ENC="$enc"
+
+# Extra absolute paths to back up (space or colon separated).
+EXTRA_DIRS="$extra_str"
+EOF
+  chmod 0600 "$CONF_FILE"
+  log "wrote $CONF_FILE (0600)"
+
+  # systemd units.
+  local oncal="$schedule"
+  local sysd="${PROFILESYNC_SYSTEMD_DIR:-/etc/systemd/system}"
+  mkdir -p "$sysd"
+  cat > "$sysd/profilesync-backup.service" <<EOF
+[Unit]
+Description=ProFileSync encrypted backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$bindst backup --push
+Nice=10
+IOSchedulingClass=idle
+EOF
+
+  cat > "$sysd/profilesync-backup.timer" <<EOF
+[Unit]
+Description=ProFileSync periodic backup ($oncal)
+
+[Timer]
+OnCalendar=$oncal
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now profilesync-backup.timer
+  log "enabled timer: profilesync-backup.timer ($oncal)"
+  log "run an immediate backup with: systemctl start profilesync-backup.service"
+  log "check logs with:             journalctl -u profilesync-backup.service"
+}
+
+cmd_uninstall() {
+  require_root
+  local purge=0
+  [[ "${1:-}" == "--purge" ]] && purge=1
+  local sysd="${PROFILESYNC_SYSTEMD_DIR:-/etc/systemd/system}"
+  systemctl disable --now profilesync-backup.timer 2>/dev/null || true
+  rm -f "$sysd/profilesync-backup.timer" \
+        "$sysd/profilesync-backup.service"
+  systemctl daemon-reload 2>/dev/null || true
+  log "removed systemd units"
+  if (( purge )); then
+    rm -f "$CONF_FILE"
+    [[ -n "${REPO_DIR:-}" ]] && rm -rf "$REPO_DIR"
+    log "purged $CONF_FILE and ${REPO_DIR:-repo dir}"
+  else
+    log "kept $CONF_FILE and repo dir (use --purge to remove)"
+  fi
+}
+
+cmd_set_passphrase() {
+  require_root
+  [[ -r "$CONF_FILE" ]] || die "no $CONF_FILE — run 'install' first"
+  [[ -n "${SSH_KEY:-}" ]] || die "SSH_KEY not set in $CONF_FILE"
+  local plain p2
+  if [[ -n "${PROFILESYNC_PASSPHRASE:-}" ]]; then
+    plain="$PROFILESYNC_PASSPHRASE"
+  else
+    read -r -s -p "New passphrase: " plain </dev/tty; echo >&2
+    read -r -s -p "Confirm:        " p2 </dev/tty; echo >&2
+    [[ "$plain" == "$p2" ]] || die "passphrases do not match"
+  fi
+  [[ -n "$plain" ]] || die "empty passphrase"
+  local enc; enc="$(printf '%s' "$plain" | encrypt_passphrase)"
+  # Replace the PASSPHRASE_ENC line in place.
+  if grep -q '^PASSPHRASE_ENC=' "$CONF_FILE"; then
+    sed -i "s|^PASSPHRASE_ENC=.*|PASSPHRASE_ENC=\"$enc\"|" "$CONF_FILE"
+  else
+    printf 'PASSPHRASE_ENC="%s"\n' "$enc" >> "$CONF_FILE"
+  fi
+  log "updated PASSPHRASE_ENC in $CONF_FILE"
+}
+
+cmd_show_config() {
+  [[ -r "$CONF_FILE" ]] || die "no $CONF_FILE"
+  log "config: $CONF_FILE"
+  sed 's/^\(PASSPHRASE_ENC=\).*/\1"<encrypted, hidden>"/' "$CONF_FILE" | sed 's/^/  /'
+  log "this machine's branch: $(machine_branch)"
+}
+
 cmd_help() {
-  sed -n '/^# profilesync/,/^# for it only when needed/p' "$0" | sed 's/^# \{0,1\}//'
+  # Anchor on the em-dash header line (unique) and stop at the first end marker
+  # so we don't re-trigger on the '# profilesync …' line inside the conf heredoc.
+  sed -n '/^# profilesync —/,/^# for it only when needed/{p;/^# for it only when needed/q}' "$0" \
+    | sed 's/^# \{0,1\}//'
 }
 
 # --- Dispatch ------------------------------------------------------------
-sub="${1:-help}"; shift || true
-case "$sub" in
-  init)     cmd_init "$@" ;;
-  status)   cmd_status "$@" ;;
-  backup)   cmd_backup "$@" ;;
-  list)     cmd_list "$@" ;;
-  branches) cmd_branches "$@" ;;
-  restore)  cmd_restore "$@" ;;
+SUBCMD="${1:-help}"; shift || true
+case "$SUBCMD" in
+  init)           cmd_init "$@" ;;
+  status)         cmd_status "$@" ;;
+  backup)         cmd_backup "$@" ;;
+  list)           cmd_list "$@" ;;
+  branches)       cmd_branches "$@" ;;
+  restore)        cmd_restore "$@" ;;
+  install)        cmd_install "$@" ;;
+  uninstall)      cmd_uninstall "$@" ;;
+  set-passphrase) cmd_set_passphrase "$@" ;;
+  show-config)    cmd_show_config "$@" ;;
   help|-h|--help) cmd_help ;;
-  *) err "unknown subcommand: $sub"; cmd_help; exit 2 ;;
+  *) err "unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac

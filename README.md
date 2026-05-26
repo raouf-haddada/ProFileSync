@@ -63,6 +63,53 @@ git clone git@github.com:raouf-haddada/ProFileSync.git && cd ProFileSync
 
 Restoring `/etc/*` entries prompts for `sudo` only when needed.
 
+## Autobackup as a service
+
+Install a systemd timer that backs up unattended. Run as root:
+
+```sh
+sudo ./bin/profilesync install \
+  --remote git@github.com:raouf-haddada/ProFileSync.git \
+  --user raouf \
+  --schedule daily \
+  --extra-dir /home/raouf/workspace/env-vars
+# prompts once for the backup passphrase (or set PROFILESYNC_PASSPHRASE)
+```
+
+This:
+
+1. Clones the repo to `--repo-dir` (default `/var/lib/profilesync/repo`).
+2. Installs the binary to `/usr/local/bin/profilesync`.
+3. Writes `/etc/profilesync.conf` (mode 0600) — see
+   [`config/profilesync.conf.example`](config/profilesync.conf.example).
+4. Installs + enables `profilesync-backup.timer` (`daily` / `hourly` / `weekly`).
+
+The config persists the **git remote**, **SSH key**, **extra dirs**, the backup
+**user**, and the **passphrase** — and the passphrase is stored encrypted.
+
+### How the passphrase is protected
+
+On install, the passphrase is encrypted with **AES-256** using a key derived
+from `sha256(<SSH private key file>)`. That SSH key is the same one used to reach
+the git remote, so:
+
+- The running service decrypts it unattended (the key is on disk).
+- A leaked `/etc/profilesync.conf` **alone** never reveals the passphrase.
+- On another machine, provisioning the **same SSH key** lets restore decrypt the
+  passphrase with the identical algorithm — no passphrase re-entry needed.
+
+Re-encode the passphrase anytime with `sudo profilesync set-passphrase`.
+
+### Service management
+
+```sh
+sudo systemctl start profilesync-backup.service   # run a backup now
+journalctl -u profilesync-backup.service          # logs
+systemctl list-timers profilesync-backup.timer    # next run
+sudo profilesync show-config                      # inspect conf (passphrase masked)
+sudo profilesync uninstall [--purge]              # remove timer (+ conf & repo)
+```
+
 ## Commands
 
 | Command | Description |
@@ -73,6 +120,10 @@ Restoring `/etc/*` entries prompts for `sudo` only when needed.
 | `list` | List local archives in `data/` |
 | `branches` | List `backup/*` branches on origin |
 | `restore [REF] [--branch n\|--mine] [--pick\|--all] [--dry-run] [--to dir] [--yes]` | Decrypt + restore |
+| `install [--remote URL] [--user N] [--ssh-key P] [--schedule S] [--extra-dir D] [--repo-dir D]` | Set up the autobackup systemd timer (root) |
+| `uninstall [--purge]` | Remove the timer/units (+ conf & repo with `--purge`) |
+| `set-passphrase` | Re-encrypt the backup passphrase into the conf (root) |
+| `show-config` | Print `/etc/profilesync.conf` (passphrase masked) |
 
 ## Notes
 

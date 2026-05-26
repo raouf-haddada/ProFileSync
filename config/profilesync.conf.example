@@ -1,0 +1,28 @@
+# /etc/profilesync.conf — per-machine config for the autobackup service.
+# Written by `profilesync install`; sourced by the tool (KEY="VALUE" shell syntax).
+# Keep mode 0600, root-owned. This file may be recreated by hand on a new
+# machine to enable unattended restore.
+
+# Git remote holding the backups (per-machine branches live here).
+GIT_REMOTE="git@github.com:raouf-haddada/ProFileSync.git"
+
+# SSH private key used BOTH to reach the repo AND to unlock the passphrase.
+SSH_KEY="/home/raouf/.ssh/id_ed25519"
+
+# Working clone the service operates on.
+REPO_DIR="/var/lib/profilesync/repo"
+
+# Whose $HOME/$USER the path list expands to (a root service backs this user up).
+BACKUP_USER="raouf"
+
+# Optional branch override. Empty → backup/<hostname>-<machine-id>.
+BRANCH=""
+
+# Backup passphrase, AES-256 encrypted with a key derived from sha256(SSH_KEY).
+# Anyone with the same SSH key (i.e. repo access) can decrypt it; the file
+# alone cannot. (Re)generate with: profilesync set-passphrase
+PASSPHRASE_ENC=""
+
+# Extra absolute paths to back up, in addition to the curated paths.conf list.
+# Space- or colon-separated.
+EXTRA_DIRS="/home/raouf/workspace/env-vars"
