@@ -827,18 +827,20 @@ list_priv_keys() {  # dir
 }
 
 # Find a private key that can reach the remote. Considers ssh -G identity files
-# for the host PLUS every private key under ~/.ssh, /root/.ssh and /etc/profilesync.
-# Purpose-named keys (deploy/profilesync) are tried first; returns the first that
-# actually authenticates (passphrase-protected keys fail under BatchMode and are
-# skipped, which is what an unattended service wants).
-detect_ssh_key() {  # remote → prints a working key path, or empty
-  local remote="$1" host f key seen="" d
+# for the host PLUS every private key under <home>/.ssh, /root/.ssh and
+# /etc/profilesync. Purpose-named keys (deploy/profilesync) are tried first;
+# returns the first that actually authenticates (passphrase-protected keys fail
+# under BatchMode and are skipped, which is what an unattended service wants).
+# $2 = home dir to search (defaults to $HOME) — passed explicitly so it works
+# under sudo, where the process $HOME is root's, not the backup user's.
+detect_ssh_key() {  # remote [search-home] → prints a working key path, or empty
+  local remote="$1" shome="${2:-$HOME}" host f key seen="" d
   host="$(printf '%s' "$remote" | sed -n 's/.*@\([^:/]*\).*/\1/p')"
   [[ -z "$host" ]] && host=github.com
   local raw=()
-  while IFS= read -r f; do f="${f/#\~/$HOME}"; raw+=("$f"); done \
-    < <(ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2}')
-  for d in "$HOME/.ssh" /root/.ssh /etc/profilesync; do
+  while IFS= read -r f; do f="${f/#\~/$shome}"; raw+=("$f"); done \
+    < <(HOME="$shome" ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2}')
+  for d in "$shome/.ssh" /root/.ssh /etc/profilesync; do
     while IFS= read -r f; do raw+=("$f"); done < <(list_priv_keys "$d")
   done
   # Dedup + keep readable.
@@ -893,8 +895,8 @@ cmd_install() {
   # SSH key: flag, else autodetect (test candidates against the backup remote).
   if [[ -z "$ssh_key" ]]; then
     log "detecting an SSH key that can reach $bremote …"
-    ssh_key="$(HOME="$bkhome" detect_ssh_key "$bremote")"
-    [[ -n "$ssh_key" ]] || die "no SSH key here can access $bremote. Pass --ssh-key <path>, or add a key to that repo as a deploy key (write access)."
+    ssh_key="$(detect_ssh_key "$bremote" "$bkhome")"
+    [[ -n "$ssh_key" ]] || die "no SSH key in ${bkhome}/.ssh (or /root/.ssh, /etc/profilesync) can access $bremote. Pass --ssh-key <path>, or add a key to that repo as a deploy key (write access)."
   fi
   ssh_key="${ssh_key/#\~/$bkhome}"
   [[ -r "$ssh_key" ]] || die "SSH key not readable: $ssh_key"
