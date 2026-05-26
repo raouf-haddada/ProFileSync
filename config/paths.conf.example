@@ -1,0 +1,60 @@
+# profilesync paths.conf
+#
+# One path per line. Lines starting with '#' and blank lines are ignored.
+# Environment variables ($HOME, $USER) are expanded.
+# Globs are NOT expanded by the tool — list directories or exact files.
+# Missing paths are skipped silently (logged in verbose mode).
+#
+# Copy this file to one of:
+#   $HOME/.config/profilesync/paths.conf
+#   <repo>/config/paths.conf
+# The first found wins. Edit freely.
+
+# --- Shell / bash ---
+$HOME/.bashrc
+$HOME/.bash_profile
+$HOME/.bash_aliases
+$HOME/.bash_logout
+$HOME/.bash_history
+$HOME/.profile
+$HOME/.inputrc
+$HOME/.zshrc
+$HOME/.zprofile
+
+# --- Editor / terminal ---
+$HOME/.vimrc
+$HOME/.tmux.conf
+$HOME/.config/nvim
+$HOME/.config/starship.toml
+
+# --- Git ---
+$HOME/.gitconfig
+$HOME/.gitignore_global
+
+# --- SSH (private keys included; archive is encrypted) ---
+$HOME/.ssh
+
+# --- GPG (public ring + trust; private keys optional) ---
+$HOME/.gnupg/pubring.kbx
+$HOME/.gnupg/trustdb.gpg
+
+# --- User scripts / bin ---
+$HOME/bin
+$HOME/scripts
+$HOME/.local/bin
+
+# --- System config (requires sudo to read/write) ---
+/etc/hosts
+/etc/hostname
+/etc/fstab
+/etc/environment
+/etc/profile
+/etc/bash.bashrc
+/etc/inputrc
+/etc/ssh/sshd_config
+/etc/ssh/ssh_config
+/etc/netplan
+/etc/sudoers.d
+
+# --- Custom paths (add your own below) ---
+/home/raouf/workspace/env-vars

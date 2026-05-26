@@ -1,0 +1,70 @@
+# profilesync excludes.conf
+#
+# tar --exclude glob patterns. One pattern per line, # for comments.
+# Patterns match path entries as written in the archive (relative to /,
+# no leading slash). '*' matches a single path component, '**' is treated
+# like '*' by GNU tar — to match anywhere, repeat the pattern with prefix.
+#
+# Copy to:
+#   $HOME/.config/profilesync/excludes.conf
+#   <repo>/config/excludes.conf
+# The first found wins.
+
+# --- Caches & build artifacts ---
+*/.cache
+*/.cache/*
+*/node_modules
+*/node_modules/*
+*/__pycache__
+*/__pycache__/*
+*.pyc
+*/.gradle
+*/.gradle/*
+*/.m2/repository
+*/.m2/repository/*
+*/target
+*/target/*
+*/dist
+*/dist/*
+*/build
+*/build/*
+*/.next
+*/.next/*
+
+# --- Containers / VM blobs ---
+*.iso
+*.img
+*.qcow2
+*.vmdk
+*.vdi
+
+# --- Large compressed blobs (already compressed; archive duplicate is pointless) ---
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.tgz
+
+# --- Browser / app data (often huge, mostly cache) ---
+*/.mozilla/firefox/*/Cache*
+*/.config/google-chrome
+*/.config/google-chrome/*
+*/.config/chromium
+*/.config/chromium/*
+*/snap/*/common/.cache
+*/.local/share/Trash
+*/.local/share/Trash/*
+
+# --- Misc ---
+*/.DS_Store
+*~
+*.swp
+*.swo
+
+# --- Logs ---
+*.log
+*/log
+*/logs

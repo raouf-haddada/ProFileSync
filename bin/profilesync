@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+# profilesync — encrypted backup/restore of dotfiles, /etc configs, scripts, keys.
+#
+# Branch model:
+#   'main'            holds only the tool (bin/, config/) and README.
+#   'backup/<host>-<id>'  one branch PER MACHINE holds that machine's encrypted
+#                     archives (latest-only tree). The id is from /etc/machine-id.
+#   Restore on another machine = clone main, then pull from a backup branch.
+#
+# Subcommands:
+#   init                Create user paths.conf / excludes.conf from templates.
+#   status              Print resolved paths that would be backed up.
+#   backup [--push]     Archive (tar+xz), encrypt (GPG AES256), commit to THIS
+#                       machine's backup branch (+ optional push). Auto-splits >45MB.
+#   list                List local archives in data/.
+#   branches            List backup/* branches (machines) on origin.
+#   restore [REF]       Decrypt and restore. Sources:
+#                         REF             a file in data/, or 'latest' (default)
+#                         --branch <name> pull latest from a backup branch
+#                         --mine          pull from THIS machine's branch
+#                       Flags: --dry-run, --yes, --pick, --all, --to <dir>.
+#                         --pick   interactive checkbox UI (whiptail/dialog)
+#                         --all    skip the picker, restore everything
+#                       Default: --pick when stdin is a TTY and whiptail exists.
+#   help                Show this help.
+#
+# Config files (first found wins):
+#   $HOME/.config/profilesync/paths.conf      what to back up
+#   $HOME/.config/profilesync/excludes.conf   tar globs to skip
+#   (repo) config/paths.conf, config/excludes.conf
+#   (repo) config/*.example   templates
+#
+# Env overrides:
+#   $PROFILESYNC_PASSPHRASE   passphrase (else prompted)
+#   $PROFILESYNC_BRANCH       override the machine branch name entirely
+#
+# Reading /etc and restoring system files requires sudo; the script will prompt
+# for it only when needed.
+
+set -euo pipefail
+
+# --- Resolve repo root (script lives in <repo>/bin) -----------------------
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+DATA_DIR="$REPO_ROOT/data"
+REPO_CONF="$REPO_ROOT/config/paths.conf"
+REPO_CONF_EXAMPLE="$REPO_ROOT/config/paths.conf.example"
+REPO_EXCLUDES="$REPO_ROOT/config/excludes.conf"
+REPO_EXCLUDES_EXAMPLE="$REPO_ROOT/config/excludes.conf.example"
+USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/paths.conf"
+USER_EXCLUDES="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/excludes.conf"
+
+# Auto-split threshold (bytes). GitHub warns over 50MB and rejects over 100MB.
+SPLIT_THRESHOLD=$((45 * 1024 * 1024))
+SPLIT_CHUNK="45M"
+
+mkdir -p "$DATA_DIR"
+
+# --- Logging -------------------------------------------------------------
+log()  { printf '\033[1;34m[profilesync]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
+err()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# --- Pick config file ----------------------------------------------------
+pick_conf() {
+  if [[ -f "$USER_CONF" ]]; then
+    printf '%s\n' "$USER_CONF"
+  elif [[ -f "$REPO_CONF" ]]; then
+    printf '%s\n' "$REPO_CONF"
+  elif [[ -f "$REPO_CONF_EXAMPLE" ]]; then
+    printf '%s\n' "$REPO_CONF_EXAMPLE"
+  else
+    die "no paths.conf found (looked in $USER_CONF, $REPO_CONF, $REPO_CONF_EXAMPLE)"
+  fi
+}
+
+# Read non-comment, non-blank, env-expanded lines from a conf file.
+read_paths() {
+  local conf="$1"
+  # shellcheck disable=SC2002
+  while IFS= read -r line; do
+    # strip comments and trim
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    # safe-ish expansion: only $VAR and ${VAR}
+    eval "printf '%s\n' \"$line\""
+  done < "$conf"
+}
+
+# Pick the active excludes file (user > repo > repo example > none).
+pick_excludes() {
+  if [[ -f "$USER_EXCLUDES" ]]; then printf '%s\n' "$USER_EXCLUDES"
+  elif [[ -f "$REPO_EXCLUDES" ]]; then printf '%s\n' "$REPO_EXCLUDES"
+  elif [[ -f "$REPO_EXCLUDES_EXAMPLE" ]]; then printf '%s\n' "$REPO_EXCLUDES_EXAMPLE"
+  fi
+}
+
+# Read raw (no env expansion) non-comment lines — used for excludes/glob patterns.
+read_patterns() {
+  local conf="$1"
+  [[ -z "$conf" || ! -f "$conf" ]] && return 0
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    printf '%s\n' "$line"
+  done < "$conf"
+}
+
+# Note: callers create their own workdir and trap inline. Pattern:
+#
+#   workdir="$(mktemp -d -t profilesync.XXXXXX)"
+#   trap "rm -rf -- '$workdir'" EXIT
+#
+# Double quotes expand $workdir at trap-set time so the literal path lives
+# in the trap body — no runtime variable lookup, no `set -u` issue after
+# the function-local var goes out of scope at return.
+
+# --- Machine identity / branch naming ------------------------------------
+# A stable per-machine id from /etc/machine-id (systemd) with fallbacks.
+machine_id() {
+  local id=""
+  [[ -r /etc/machine-id ]] && id="$(< /etc/machine-id)"
+  [[ -z "$id" && -r /var/lib/dbus/machine-id ]] && id="$(< /var/lib/dbus/machine-id)"
+  [[ -z "$id" ]] && id="$(hostname | sha256sum | cut -c1-32)"
+  printf '%s' "$id"
+}
+
+# Branch for this machine: backup/<hostname>-<short-id>.
+# $PROFILESYNC_BRANCH overrides entirely (e.g. for a custom scheme).
+machine_branch() {
+  if [[ -n "${PROFILESYNC_BRANCH:-}" ]]; then
+    printf '%s' "$PROFILESYNC_BRANCH"
+    return
+  fi
+  local h id
+  h="$(hostname -s | tr -c 'A-Za-z0-9_.-' '-')"
+  id="$(machine_id)"
+  printf 'backup/%s-%s' "$h" "${id:0:12}"
+}
+
+# Normalize a user-supplied branch ref: add backup/ prefix if missing.
+norm_branch() {
+  local b="$1"
+  [[ "$b" == backup/* ]] && { printf '%s' "$b"; return; }
+  printf 'backup/%s' "$b"
+}
+
+# Commit a set of working-tree files to $branch as a *latest-only* tree
+# (the tree contains exactly the listed files), parented on the prior tip
+# so history is preserved. Uses a temp index; never touches the work tree
+# or the currently checked-out branch.
+# Args: $1=branch  $2=message  $3..=repo-relative file paths
+commit_to_branch() {
+  local branch="$1" msg="$2"; shift 2
+  local tmpindex; tmpindex="$(mktemp -u -t profilesync-idx.XXXXXX)"
+  local f blob mode tree commit
+  (
+    export GIT_INDEX_FILE="$tmpindex"
+    cd "$REPO_ROOT"
+    for f in "$@"; do
+      blob="$(git hash-object -w -- "$f")"
+      if [[ -x "$f" ]]; then mode=100755; else mode=100644; fi
+      git update-index --add --cacheinfo "$mode,$blob,$f"
+    done
+    tree="$(git write-tree)"
+    local parent_args=()
+    if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+      parent_args=(-p "refs/heads/$branch")
+    fi
+    commit="$(git commit-tree "$tree" "${parent_args[@]}" -m "$msg")"
+    git update-ref "refs/heads/$branch" "$commit"
+  )
+  rm -f "$tmpindex"
+}
+
+# --- Passphrase ----------------------------------------------------------
+get_passphrase() {
+  if [[ -n "${PROFILESYNC_PASSPHRASE:-}" ]]; then
+    printf '%s' "$PROFILESYNC_PASSPHRASE"
+    return
+  fi
+  local p1 p2
+  read -r -s -p "Passphrase: " p1 </dev/tty; echo >&2
+  if [[ "${1:-}" == "confirm" ]]; then
+    read -r -s -p "Confirm:    " p2 </dev/tty; echo >&2
+    [[ "$p1" == "$p2" ]] || die "passphrases do not match"
+  fi
+  [[ -n "$p1" ]] || die "empty passphrase"
+  printf '%s' "$p1"
+}
+
+# --- Subcommands ---------------------------------------------------------
+
+cmd_init() {
+  mkdir -p "$(dirname "$USER_CONF")"
+  if [[ -f "$USER_CONF" ]]; then
+    warn "$USER_CONF already exists — not overwriting"
+  else
+    cp -- "$REPO_CONF_EXAMPLE" "$USER_CONF"
+    log "created $USER_CONF — edit it to taste"
+  fi
+  if [[ -f "$USER_EXCLUDES" ]]; then
+    warn "$USER_EXCLUDES already exists — not overwriting"
+  else
+    cp -- "$REPO_EXCLUDES_EXAMPLE" "$USER_EXCLUDES"
+    log "created $USER_EXCLUDES"
+  fi
+}
+
+cmd_status() {
+  local conf; conf="$(pick_conf)"
+  log "using config: $conf"
+  local missing=0 present=0
+  while IFS= read -r p; do
+    if [[ -e "$p" ]]; then
+      printf '  ✓ %s\n' "$p"
+      present=$((present+1))
+    elif [[ -r "$p" ]] 2>/dev/null; then
+      printf '  ✓ %s\n' "$p"
+      present=$((present+1))
+    else
+      # /etc paths may need sudo to stat; try with sudo non-interactively
+      if sudo -n test -e "$p" 2>/dev/null; then
+        printf '  ✓ %s (sudo)\n' "$p"
+        present=$((present+1))
+      else
+        printf '  · %s (missing)\n' "$p"
+        missing=$((missing+1))
+      fi
+    fi
+  done < <(read_paths "$conf")
+  log "$present present, $missing missing"
+}
+
+cmd_backup() {
+  local push=0
+  local message=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --push) push=1; shift ;;
+      -m|--message) message="$2"; shift 2 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local conf; conf="$(pick_conf)"
+  log "using config: $conf"
+
+  # Collect resolved paths, splitting into those needing sudo and those not.
+  local user_paths=() etc_paths=()
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if [[ "$p" == /etc/* ]] || [[ "$p" == /etc ]]; then
+      etc_paths+=("$p")
+    else
+      user_paths+=("$p")
+    fi
+  done < <(read_paths "$conf")
+
+  local ts host outfile workdir
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  host="$(hostname -s)"
+  # .tar.xz.gpg — xz compresses configs/binaries much better than gzip.
+  outfile="$DATA_DIR/profilesync-${host}-${ts}.tar.xz.gpg"
+  local base; base="$(basename "$outfile")"
+  workdir="$(mktemp -d -t profilesync.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$workdir'" EXIT
+
+  # Build the file list (relative to /) and a sibling manifest of original
+  # absolute paths (used by restore for the interactive picker).
+  local listfile="$workdir/files.list"
+  local manifest_dir="$workdir/.profilesync"
+  local manifest="$manifest_dir/manifest"
+  mkdir -p "$manifest_dir"
+  : > "$listfile"
+  : > "$manifest"
+  local p_rel
+  for p in "${user_paths[@]}" "${etc_paths[@]}"; do
+    if [[ -e "$p" ]] || sudo -n test -e "$p" 2>/dev/null || sudo test -e "$p" 2>/dev/null; then
+      p_rel="${p#/}"
+      printf '%s\n' "$p_rel" >> "$listfile"
+      printf '%s\n' "$p" >> "$manifest"
+    else
+      warn "skipping (not found): $p"
+    fi
+  done
+
+  [[ -s "$listfile" ]] || die "nothing to back up"
+
+  # Build tar exclude args from excludes.conf (if present).
+  local excludes_file; excludes_file="$(pick_excludes)"
+  local tar_excludes=()
+  if [[ -n "$excludes_file" ]]; then
+    log "using excludes: $excludes_file"
+    while IFS= read -r pat; do
+      tar_excludes+=("--exclude=$pat")
+    done < <(read_patterns "$excludes_file")
+  fi
+
+  log "archiving $(wc -l < "$listfile") path(s)…"
+
+  # Use sudo if any /etc path is in the list, so tar can read root-owned files.
+  local need_sudo=0
+  if grep -q '^etc/' "$listfile"; then need_sudo=1; fi
+
+  local pass
+  pass="$(get_passphrase confirm)"
+
+  # tar -cJf  → xz; --compress-algo none keeps GPG from re-compressing.
+  # Two -C clauses: bundle the manifest from $workdir, then files from /.
+  local tar_cmd=(tar --ignore-failed-read -cJf -
+                 "${tar_excludes[@]}"
+                 -C "$workdir" .profilesync/manifest
+                 -C / --files-from="$listfile")
+  if (( need_sudo )); then
+    log "sudo needed to read /etc files"
+    sudo "${tar_cmd[@]}" \
+      | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 \
+            --compress-algo none -o "$outfile" 3<<<"$pass"
+  else
+    "${tar_cmd[@]}" \
+      | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --symmetric --cipher-algo AES256 \
+            --compress-algo none -o "$outfile" 3<<<"$pass"
+  fi
+
+  # If sudo was used, the file might be owned by root.
+  if [[ "$(stat -c '%u' "$outfile")" != "$(id -u)" ]]; then
+    sudo chown "$(id -u):$(id -g)" "$outfile"
+  fi
+
+  local size; size="$(stat -c %s "$outfile")"
+  local human; human="$(du -h "$outfile" | cut -f1)"
+  log "encrypted archive: $base ($human)"
+
+  # Auto-split if over threshold so individual files stay under GitHub's 50MB.
+  local committed_files=("data/$base")
+  if (( size > SPLIT_THRESHOLD )); then
+    log "splitting into ${SPLIT_CHUNK} chunks (> 50MB single-file limit)"
+    split -b "$SPLIT_CHUNK" -d -a 3 -- "$outfile" "${outfile}.part"
+    rm -f -- "$outfile"
+    committed_files=()
+    shopt -s nullglob
+    for part in "$DATA_DIR/${base}.part"*; do
+      committed_files+=("data/$(basename "$part")")
+      printf '  → %s (%s)\n' "$(basename "$part")" "$(du -h "$part" | cut -f1)" >&2
+    done
+    shopt -u nullglob
+  fi
+
+  # Update local 'latest' symlink (used for offline `list`/`restore`; never
+  # tracked in git — backups live only on the machine branch).
+  ln -sfn -- "$base" "$DATA_DIR/latest"
+
+  # Commit the archive(s) to THIS MACHINE's branch (latest-only tree),
+  # leaving main untouched. Optionally push that branch.
+  local branch; branch="$(machine_branch)"
+  local msg="${message:-backup: ${host} ${ts} (${base})}"
+  local has_remote=0
+  git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1 && has_remote=1
+
+  # Chain on the remote tip if reachable, so the new commit fast-forwards.
+  if (( push )) && (( has_remote )); then
+    git -C "$REPO_ROOT" fetch -q origin "+refs/heads/$branch:refs/heads/$branch" 2>/dev/null || true
+  fi
+
+  commit_to_branch "$branch" "$msg" "${committed_files[@]}"
+  log "committed to branch: $branch"
+
+  if (( push )); then
+    if (( has_remote )); then
+      git -C "$REPO_ROOT" push origin "refs/heads/$branch:refs/heads/$branch"
+      log "pushed $branch to origin"
+    else
+      warn "no 'origin' remote configured — skipping push"
+    fi
+  else
+    log "not pushed (use 'backup --push'); branch ref updated locally"
+  fi
+}
+
+cmd_list() {
+  log "backups in $DATA_DIR:"
+  local found=0
+  shopt -s nullglob
+  # Single-file archives.
+  for f in "$DATA_DIR"/profilesync-*.tar.gz.gpg "$DATA_DIR"/profilesync-*.tar.xz.gpg; do
+    printf '  %s  %s\n' "$(du -h "$f" | cut -f1)" "$(basename "$f")"
+    found=1
+  done
+  # Split-archive sets: aggregate by basename.
+  declare -A seen_bases=()
+  for p in "$DATA_DIR"/profilesync-*.tar.*.gpg.part*; do
+    local b; b="$(basename "$p")"; b="${b%.part*}"
+    [[ -n "${seen_bases[$b]:-}" ]] && continue
+    seen_bases[$b]=1
+    local total=0 n=0
+    for pp in "$DATA_DIR/${b}.part"*; do
+      total=$(( total + $(stat -c %s "$pp") ))
+      n=$((n+1))
+    done
+    printf '  %s  %s  (%d parts, split)\n' \
+      "$(numfmt --to=iec --suffix=B "$total" 2>/dev/null || echo "${total}B")" \
+      "$b" "$n"
+    found=1
+  done
+  shopt -u nullglob
+  if [[ -L "$DATA_DIR/latest" ]]; then
+    printf '  latest -> %s\n' "$(readlink "$DATA_DIR/latest")"
+  fi
+  (( found )) || warn "no backups found"
+}
+
+# Resolve a ref to an actual readable file path. Handles three cases:
+#   1. single file present at $DATA_DIR/$ref         → return it
+#   2. split set: $DATA_DIR/$ref.part* exist         → cat them into $workdir
+#   3. absolute path passed                          → use it (or cat its parts)
+resolve_src() {
+  local ref="$1" workdir="$2"
+  local candidate=""
+  if [[ -L "$DATA_DIR/$ref" ]]; then
+    ref="$(readlink "$DATA_DIR/$ref")"
+  fi
+  if [[ -f "$DATA_DIR/$ref" ]]; then
+    candidate="$DATA_DIR/$ref"
+  elif [[ -f "$ref" ]]; then
+    candidate="$ref"
+  fi
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+  # Try split set.
+  shopt -s nullglob
+  local parts=("$DATA_DIR/${ref}.part"*)
+  shopt -u nullglob
+  if (( ${#parts[@]} > 0 )); then
+    local combined="$workdir/combined.gpg"
+    log "joining ${#parts[@]} parts → $(basename "$combined")"
+    cat -- "${parts[@]}" > "$combined"
+    printf '%s\n' "$combined"
+    return
+  fi
+  die "backup not found: $ref (looked in $DATA_DIR)"
+}
+
+# Read the latest archive directly out of a backup branch's tree (no checkout).
+# Concatenates split parts in order. Returns the path to a decrypt-ready file.
+src_from_branch() {
+  local branch="$1" workdir="$2"
+  branch="$(norm_branch "$branch")"
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch -q origin \
+      "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
+  fi
+  local ref=""
+  if git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+    ref="refs/remotes/origin/$branch"
+  elif git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    ref="refs/heads/$branch"
+  else
+    die "branch not found locally or on origin: $branch"
+  fi
+  local files
+  files="$(git -C "$REPO_ROOT" ls-tree -r --name-only "$ref" -- data/ \
+           | grep -E '\.tar\.(gz|xz)\.gpg(\.part[0-9]+)?$' | sort)"
+  [[ -n "$files" ]] || die "no archive found in $branch"
+  log "reading $(printf '%s\n' "$files" | wc -l) blob(s) from $branch"
+  local combined="$workdir/from-branch.gpg" f
+  : > "$combined"
+  while IFS= read -r f; do
+    git -C "$REPO_ROOT" cat-file blob "$ref:$f" >> "$combined"
+  done <<< "$files"
+  printf '%s' "$combined"
+}
+
+cmd_branches() {
+  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+    git -C "$REPO_ROOT" fetch -q origin \
+      '+refs/heads/backup/*:refs/remotes/origin/backup/*' 2>/dev/null || true
+  fi
+  local cur; cur="$(machine_branch)"
+  log "backup branches (* = this machine):"
+  declare -A seen=()
+  local found=0 refname date subj
+  while IFS=$'\t' read -r refname date subj; do
+    [[ -z "$refname" ]] && continue
+    local short="${refname#refs/remotes/origin/}"; short="${short#refs/heads/}"
+    [[ -n "${seen[$short]:-}" ]] && continue
+    seen[$short]=1
+    local marker=" "; [[ "$short" == "$cur" ]] && marker="*"
+    printf '  %s %-42s %s  %s\n' "$marker" "$short" "$date" "$subj"
+    found=1
+  done < <(git -C "$REPO_ROOT" for-each-ref --sort=-committerdate \
+            --format='%(refname)%09%(committerdate:short)%09%(contents:subject)' \
+            refs/remotes/origin/backup refs/heads/backup 2>/dev/null)
+  (( found )) || warn "no backup branches found (run 'backup --push' first)"
+}
+
+cmd_restore() {
+  local ref="latest"
+  local dry=0 yes=0 pick=0 all=0
+  local target="/"
+  local from_branch=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)   dry=1; shift ;;
+      --yes|-y)    yes=1; shift ;;
+      --pick)      pick=1; shift ;;
+      --all)       all=1; shift ;;
+      --branch)    from_branch="$2"; shift 2 ;;
+      --mine)      from_branch="$(machine_branch)"; shift ;;
+      --to)        target="$2"; shift 2 ;;
+      -*)          die "unknown flag: $1" ;;
+      *)           ref="$1"; shift ;;
+    esac
+  done
+
+  local workdir; workdir="$(mktemp -d -t profilesync.XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$workdir'" EXIT
+  local src
+  if [[ -n "$from_branch" ]]; then
+    src="$(src_from_branch "$from_branch" "$workdir")"
+  else
+    src="$(resolve_src "$ref" "$workdir")"
+  fi
+
+  log "restoring from: $src"
+  log "target root:    $target"
+
+  local pass; pass="$(get_passphrase)"
+
+  local tarball="$workdir/archive.tar"
+  gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --decrypt -o "$tarball" 3<<<"$pass" "$src" 2>/dev/null \
+    || die "decryption failed (wrong passphrase?)"
+
+  # List members once (tar auto-detects xz vs gzip from magic bytes).
+  local members="$workdir/members.list"
+  tar -tf "$tarball" > "$members"
+
+  # Build candidate entries for selection:
+  #   prefer the embedded manifest (absolute paths from backup time)
+  #   else fall back to top-level dirs/files in the archive.
+  local candidates="$workdir/candidates.list"
+  if grep -q '^\.profilesync/manifest$' "$members"; then
+    tar -xf "$tarball" -C "$workdir" .profilesync/manifest
+    cp -- "$workdir/.profilesync/manifest" "$candidates"
+  else
+    awk -F/ '{print "/" $1}' "$members" \
+      | grep -v '^/\.profilesync$' \
+      | sort -u > "$candidates"
+  fi
+
+  # Decide whether to use the interactive picker.
+  local use_picker=0
+  if (( pick )); then
+    use_picker=1
+  elif (( all )); then
+    use_picker=0
+  elif [[ -t 0 && -t 1 ]] && command -v whiptail >/dev/null 2>&1; then
+    use_picker=1
+  fi
+
+  # Final selection (absolute paths, one per line).
+  local selection="$workdir/selection.list"
+  if (( use_picker )); then
+    pick_entries "$candidates" "$selection" || die "no entries selected"
+  else
+    cp -- "$candidates" "$selection"
+  fi
+
+  # Expand each selected path to all matching archive members.
+  local extract_list="$workdir/extract.list"
+  : > "$extract_list"
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    local rel="${p#/}"
+    # Match the exact name or anything underneath it.
+    awk -v r="$rel" 'BEGIN{rl=length(r)} \
+      $0==r || substr($0,1,rl+1)==r"/" {print}' "$members" >> "$extract_list"
+  done < "$selection"
+
+  if [[ ! -s "$extract_list" ]]; then
+    die "selection produced no archive members"
+  fi
+
+  local needs_root=0
+  grep -q '^etc/' "$extract_list" && needs_root=1
+
+  log "will restore $(wc -l < "$selection") path(s), $(wc -l < "$extract_list") file(s):"
+  sed 's/^/  /' "$selection" >&2
+
+  if (( dry )); then
+    log "dry-run — nothing written"
+    return
+  fi
+
+  if ! (( yes )); then
+    printf '\033[1;33mProceed with restore to %s? [y/N] \033[0m' "$target" >&2
+    local reply; read -r reply </dev/tty
+    [[ "$reply" =~ ^[Yy]$ ]] || die "aborted by user"
+  fi
+
+  local xt=(tar -xpf "$tarball" -C "$target" --files-from="$extract_list")
+  if (( needs_root )); then
+    log "sudo needed to write /etc files"
+    sudo "${xt[@]}"
+  else
+    "${xt[@]}"
+  fi
+  log "restore complete"
+}
+
+# Show a whiptail (fallback: dialog) checklist of entries.
+# Args: $1=candidates-file (one absolute path per line)
+#       $2=output-file     (selected paths written here, one per line)
+pick_entries() {
+  local candidates="$1" out="$2"
+  local tool=""
+  if command -v whiptail >/dev/null 2>&1; then tool=whiptail
+  elif command -v dialog  >/dev/null 2>&1; then tool=dialog
+  else die "neither whiptail nor dialog is installed — use --all or install one"
+  fi
+
+  # Build argv: TAG ITEM ON/OFF triples. TAG = line number (1-based).
+  local args=() i=0
+  while IFS= read -r line; do
+    i=$((i+1))
+    args+=("$i" "$line" "ON")
+  done < "$candidates"
+  (( i > 0 )) || die "no candidates to choose from"
+
+  local selected
+  # Redirect tricks: whiptail prints result on stderr; swap fds.
+  if ! selected="$( "$tool" --separate-output --title "profilesync restore" \
+        --checklist "Select what to restore (space to toggle, enter to confirm):" \
+        25 90 16 "${args[@]}" 3>&1 1>&2 2>&3 )"; then
+    return 1
+  fi
+
+  : > "$out"
+  while IFS= read -r tag; do
+    [[ -z "$tag" ]] && continue
+    sed -n "${tag}p" "$candidates" >> "$out"
+  done <<< "$selected"
+  [[ -s "$out" ]]
+}
+
+cmd_help() {
+  sed -n '/^# profilesync/,/^# for it only when needed/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- Dispatch ------------------------------------------------------------
+sub="${1:-help}"; shift || true
+case "$sub" in
+  init)     cmd_init "$@" ;;
+  status)   cmd_status "$@" ;;
+  backup)   cmd_backup "$@" ;;
+  list)     cmd_list "$@" ;;
+  branches) cmd_branches "$@" ;;
+  restore)  cmd_restore "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) err "unknown subcommand: $sub"; cmd_help; exit 2 ;;
+esac

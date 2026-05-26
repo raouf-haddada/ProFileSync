@@ -1,0 +1,12 @@
+# 'main' tracks only the tool + README. Backup archives live on per-machine
+# 'backup/<host>-<id>' branches, written via git plumbing — never staged on main.
+data/*
+!data/.gitkeep
+
+# Local-only user config (real paths may be machine-specific).
+config/paths.conf
+config/excludes.conf
+
+# Scratch / decrypted artifacts.
+*.tmp
+.tmp/
