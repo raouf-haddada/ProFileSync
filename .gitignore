@@ -10,3 +10,8 @@ config/excludes.conf
 # Scratch / decrypted artifacts.
 *.tmp
 .tmp/
+
+# Editor / IDE.
+.idea/
+.vscode/
+*.swp
