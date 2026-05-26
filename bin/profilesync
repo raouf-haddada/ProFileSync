@@ -35,6 +35,8 @@
 #                         --repo-dir DIR   service work repo (/var/lib/profilesync/repo)
 #                         --schedule S     daily|hourly|weekly (default: daily)
 #                         --extra-dir DIR  extra path to back up (repeatable)
+#                         --generate-deploy-key  make a passphrase-less deploy key,
+#                                          print its .pub to authorize, then stop
 #   uninstall [--purge] Remove the timer/units (+ conf, sysconf & repo w/ --purge).
 #   set-passphrase      Re-encrypt the backup passphrase into the conf.
 #   show-config         Print /etc/profilesync.conf (passphrase masked).
@@ -861,11 +863,59 @@ detect_ssh_key() {  # remote [search-home] → prints a working key path, or emp
   done
 }
 
+# Print, per candidate key, its passphrase status and why it can't reach the
+# remote — so a failed auto-detect explains itself instead of being opaque.
+diagnose_keys() {  # remote search-home
+  local remote="$1" shome="$2" host f seen="" any=0 d
+  host="$(printf '%s' "$remote" | sed -n 's/.*@\([^:/]*\).*/\1/p')"
+  [[ -z "$host" ]] && host=github.com
+  local raw=()
+  while IFS= read -r f; do f="${f/#\~/$shome}"; raw+=("$f"); done \
+    < <(HOME="$shome" ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2}')
+  for d in "$shome/.ssh" /root/.ssh /etc/profilesync; do
+    while IFS= read -r f; do raw+=("$f"); done < <(list_priv_keys "$d")
+  done
+  warn "per-key diagnostics for $remote:"
+  for f in "${raw[@]}"; do
+    [[ -r "$f" ]] || continue
+    case " $seen " in *" $f "*) continue ;; esac
+    seen="$seen $f"
+    any=1
+    local pp out
+    if key_has_passphrase "$f"; then pp="passphrase!"; else pp="no-pass"; fi
+    out="$(GIT_SSH_COMMAND="$(ssh_cmd_for "$f")" git ls-remote "$remote" 2>&1 >/dev/null | head -1)"
+    [[ -z "$out" ]] && out="OK — reachable"
+    printf '    %-28s [%-11s] %s\n' "${f##*/}" "$pp" "$out" >&2
+  done
+  (( any )) || printf '    (no private keys found under %s/.ssh, /root/.ssh, /etc/profilesync)\n' "$shome" >&2
+}
+
+# Create a passphrase-less ed25519 deploy key owned by the backup user, print
+# its public half, and explain how to authorize it on the backup repo.
+generate_deploy_key() {  # path owner-user
+  local path="$1" owner="$2"
+  if [[ -f "$path" ]]; then
+    log "deploy key already exists: $path"
+  else
+    mkdir -p "$(dirname "$path")"
+    ssh-keygen -t ed25519 -N '' -C "profilesync@$(hostname -s)" -f "$path" -q
+    chown "$owner:$(id -gn "$owner")" "$path" "$path.pub" 2>/dev/null || true
+    log "generated deploy key: $path"
+  fi
+  echo >&2
+  warn "Add this PUBLIC key to the backup repo as a DEPLOY KEY with WRITE access:"
+  echo >&2
+  sed 's/^/    /' "$path.pub" >&2
+  echo >&2
+  warn "GitLab: repo → Settings → Repository → Deploy keys → enable 'write access'."
+  warn "Then re-run install with:  --ssh-key $path"
+}
+
 cmd_install() {
   require_root
   local bremote="" ssh_key="" bkuser="${SUDO_USER:-}" repodir="/var/lib/profilesync/repo"
   local schedule="daily" bindst="/usr/local/bin/profilesync"
-  local extra=()
+  local extra=() gen_key=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --backup-remote) bremote="$2"; shift 2 ;;
@@ -875,6 +925,7 @@ cmd_install() {
       --repo-dir)      repodir="$2"; shift 2 ;;
       --schedule)      schedule="$2"; shift 2 ;;
       --extra-dir)     extra+=("$2"); shift 2 ;;
+      --generate-deploy-key) gen_key=1; shift ;;
       --bin)           bindst="$2"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
@@ -892,11 +943,26 @@ cmd_install() {
   fi
   [[ -n "$bremote" ]] || die "no backup remote — pass --backup-remote git@host:org/backups.git"
 
+  # Explicit deploy-key generation: make one, show its pubkey, stop so the user
+  # can authorize it on the backup repo, then re-run.
+  if (( gen_key )) && [[ -z "$ssh_key" ]]; then
+    generate_deploy_key "$bkhome/.ssh/profilesync_deploy" "$bkuser"
+    exit 0
+  fi
+
   # SSH key: flag, else autodetect (test candidates against the backup remote).
   if [[ -z "$ssh_key" ]]; then
     log "detecting an SSH key that can reach $bremote …"
     ssh_key="$(detect_ssh_key "$bremote" "$bkhome")"
-    [[ -n "$ssh_key" ]] || die "no SSH key in ${bkhome}/.ssh (or /root/.ssh, /etc/profilesync) can access $bremote. Pass --ssh-key <path>, or add a key to that repo as a deploy key (write access)."
+    if [[ -z "$ssh_key" ]]; then
+      diagnose_keys "$bremote" "$bkhome"
+      die "no usable (passphrase-less, authorized) SSH key found. Either:
+   - generate a deploy key and authorize it on the repo:
+       … install --backup-remote $bremote --user $bkuser --generate-deploy-key
+   - or pass an existing one with --ssh-key <path>.
+   (Keys marked [passphrase!] can't be used unattended; keys showing 'Permission
+    denied' aren't authorized on the repo.)"
+    fi
   fi
   ssh_key="${ssh_key/#\~/$bkhome}"
   [[ -r "$ssh_key" ]] || die "SSH key not readable: $ssh_key"
@@ -910,9 +976,9 @@ cmd_install() {
   fi
   if key_has_passphrase "$ssh_key"; then
     die "SSH key is passphrase-protected: $ssh_key
-  An unattended service cannot unlock it. Use a passphrase-less deploy key
-  (e.g. ssh-keygen -t ed25519 -N '' -f ~/.ssh/profilesync_deploy, then add the
-  .pub to the backup repo's deploy keys) and pass it with --ssh-key."
+  An unattended service cannot unlock it. Generate a passphrase-less deploy key:
+       … install --backup-remote $bremote --user $bkuser --generate-deploy-key
+  then authorize its .pub on the repo and re-run with --ssh-key."
   fi
   SSH_KEY="$ssh_key"   # so pass_key() works below
 
