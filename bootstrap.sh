@@ -17,7 +17,10 @@
 #   PROFILESYNC_KEEP=1       keep the temporary clone (for debugging)
 set -euo pipefail
 
-TOOL_REMOTE="${PROFILESYNC_TOOL_REMOTE:-git@github.com:raouf-haddada/ProFileSync.git}"
+# Public tool repo → clone over HTTPS so it works anonymously (incl. as root,
+# where the user's SSH agent/keys aren't available). Override for a private/SSH
+# tool repo via PROFILESYNC_TOOL_REMOTE.
+TOOL_REMOTE="${PROFILESYNC_TOOL_REMOTE:-https://github.com/raouf-haddada/ProFileSync.git}"
 TOOL_REF="${PROFILESYNC_TOOL_REF:-main}"
 
 command -v git >/dev/null 2>&1 || { echo "[bootstrap] git is required" >&2; exit 1; }
