@@ -15,9 +15,11 @@
 #   list                List local archives in data/.
 #   branches            List backup/* branches (machines) on origin.
 #   restore [REF]       Decrypt and restore. Sources:
-#                         REF             a file in data/, or 'latest' (default)
-#                         --branch <name> pull latest from a backup branch
-#                         --mine          pull from THIS machine's branch
+#                         REF              a file in data/, or 'latest' (default)
+#                         --branch <name>  pull latest from a backup branch
+#                         --mine           pull from THIS machine's branch
+#                         --remote <url>   fetch from an arbitrary backup repo
+#                                          (ad-hoc; defaults branch to this machine)
 #                       Flags: --dry-run, --yes, --pick, --all, --to <dir>.
 #                         --pick   interactive checkbox UI (whiptail/dialog)
 #                         --all    skip the picker, restore everything
@@ -26,28 +28,32 @@
 #
 # Service (autobackup) — run as root:
 #   install [opts]      Install systemd timer + write /etc/profilesync.conf.
-#                         --remote URL     git remote (default: this repo's origin)
-#                         --ssh-key PATH   repo SSH key (default: autodetect)
+#                         --backup-remote URL  repo that HOLDS the backups
+#                                              (default: this clone's origin)
+#                         --ssh-key PATH   key for the backup remote (autodetect)
 #                         --user NAME      whose home to back up (default: $SUDO_USER)
-#                         --repo-dir DIR   service clone (default: /var/lib/profilesync/repo)
+#                         --repo-dir DIR   service work repo (/var/lib/profilesync/repo)
 #                         --schedule S     daily|hourly|weekly (default: daily)
 #                         --extra-dir DIR  extra path to back up (repeatable)
-#   uninstall [--purge] Remove the timer/units (+ conf & repo with --purge).
+#   uninstall [--purge] Remove the timer/units (+ conf, sysconf & repo w/ --purge).
 #   set-passphrase      Re-encrypt the backup passphrase into the conf.
 #   show-config         Print /etc/profilesync.conf (passphrase masked).
 #
-# Machine config (/etc/profilesync.conf, sourced if present):
-#   GIT_REMOTE, SSH_KEY, REPO_DIR, BACKUP_USER, BRANCH, EXTRA_DIRS, PASSPHRASE_ENC
-#   The passphrase is encrypted with AES-256 keyed on sha256(SSH_KEY file), so
-#   the same SSH key that reaches the repo also unlocks the passphrase. The
-#   service decrypts it unattended; restore on another machine with the same key
-#   works identically.
+# The BACKUP REPO (where archives are pushed as backup/* branches) is
+# independent of the tool's own source repo — they can be different repos on
+# different hosts.
 #
-# Per-user config files (first found wins):
-#   $HOME/.config/profilesync/paths.conf      what to back up
-#   $HOME/.config/profilesync/excludes.conf   tar globs to skip
-#   (repo) config/paths.conf, config/excludes.conf
-#   (repo) config/*.example   templates
+# Machine config (/etc/profilesync.conf, sourced if present):
+#   BACKUP_REMOTE, SSH_KEY, REPO_DIR, BACKUP_USER, BRANCH, EXTRA_DIRS, PASSPHRASE_ENC
+#   The passphrase is encrypted with AES-256 keyed on sha256(SSH_KEY file), so
+#   the same SSH key that reaches the backup repo also unlocks the passphrase.
+#   The service decrypts it unattended; restore on another machine with the same
+#   key works identically.
+#
+# Config file search (first found wins):
+#   $HOME/.config/profilesync/{paths,excludes}.conf   per-user
+#   /etc/profilesync.d/{paths,excludes}.conf          system (seeded by install)
+#   (repo) config/{paths,excludes}.conf and *.example templates
 #
 # Env overrides:
 #   $PROFILESYNC_PASSPHRASE   passphrase (else from conf, else prompted)
@@ -77,17 +83,15 @@ if [[ -n "${BACKUP_USER:-}" ]]; then
 fi
 
 # --- Resolve repo root ---------------------------------------------------
-# When run from inside a clone (<repo>/bin/profilesync, dev), use that clone so
-# local iteration ignores any installed conf. Otherwise (installed binary at
-# /usr/local/bin) use REPO_DIR from the machine config.
+# An explicit REPO_DIR in the machine config is authoritative — when configured,
+# git ops target that repo (whose origin is the backup remote), regardless of
+# where the binary lives. Otherwise (no conf) use the script-relative clone, so
+# running straight from a checkout "just works" for dev/manual use.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-_script_repo="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-if git -C "$_script_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  REPO_ROOT="$_script_repo"
-elif [[ -n "${REPO_DIR:-}" ]]; then
+if [[ -n "${REPO_DIR:-}" ]]; then
   REPO_ROOT="$REPO_DIR"
 else
-  REPO_ROOT="$_script_repo"
+  REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 fi
 DATA_DIR="$REPO_ROOT/data"
 REPO_CONF="$REPO_ROOT/config/paths.conf"
@@ -97,7 +101,18 @@ REPO_EXCLUDES_EXAMPLE="$REPO_ROOT/config/excludes.conf.example"
 USER_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/paths.conf"
 USER_EXCLUDES="${XDG_CONFIG_HOME:-$HOME/.config}/profilesync/excludes.conf"
 
-# Use the repo's SSH key for all git transport when configured.
+# System path lists (seeded by `install`) so the service's config does not
+# depend on the backup repo's contents.
+SYS_CONF_DIR="${PROFILESYNC_SYS_CONF_DIR:-/etc/profilesync.d}"
+SYS_CONF="$SYS_CONF_DIR/paths.conf"
+SYS_EXCLUDES="$SYS_CONF_DIR/excludes.conf"
+
+# The repository that holds the backups (per-machine branches). This is
+# independent of the tool's own source repo. Accept BACKUP_REMOTE, fall back to
+# the legacy GIT_REMOTE name.
+BACKUP_REMOTE="${BACKUP_REMOTE:-${GIT_REMOTE:-}}"
+
+# Use the configured SSH key for all git transport.
 if [[ -n "${SSH_KEY:-}" ]]; then
   export GIT_SSH_COMMAND="ssh -i ${SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 fi
@@ -123,12 +138,14 @@ die()  { err "$*"; exit 1; }
 pick_conf() {
   if [[ -f "$USER_CONF" ]]; then
     printf '%s\n' "$USER_CONF"
+  elif [[ -f "$SYS_CONF" ]]; then
+    printf '%s\n' "$SYS_CONF"
   elif [[ -f "$REPO_CONF" ]]; then
     printf '%s\n' "$REPO_CONF"
   elif [[ -f "$REPO_CONF_EXAMPLE" ]]; then
     printf '%s\n' "$REPO_CONF_EXAMPLE"
   else
-    die "no paths.conf found (looked in $USER_CONF, $REPO_CONF, $REPO_CONF_EXAMPLE)"
+    die "no paths.conf found (looked in $USER_CONF, $SYS_CONF, $REPO_CONF, $REPO_CONF_EXAMPLE)"
   fi
 }
 
@@ -147,9 +164,10 @@ read_paths() {
   done < "$conf"
 }
 
-# Pick the active excludes file (user > repo > repo example > none).
+# Pick the active excludes file (user > system > repo > repo example > none).
 pick_excludes() {
   if [[ -f "$USER_EXCLUDES" ]]; then printf '%s\n' "$USER_EXCLUDES"
+  elif [[ -f "$SYS_EXCLUDES" ]]; then printf '%s\n' "$SYS_EXCLUDES"
   elif [[ -f "$REPO_EXCLUDES" ]]; then printf '%s\n' "$REPO_EXCLUDES"
   elif [[ -f "$REPO_EXCLUDES_EXAMPLE" ]]; then printf '%s\n' "$REPO_EXCLUDES_EXAMPLE"
   fi
@@ -557,20 +575,29 @@ resolve_src() {
 
 # Read the latest archive directly out of a backup branch's tree (no checkout).
 # Concatenates split parts in order. Returns the path to a decrypt-ready file.
+# $3 (optional) = a backup remote URL to fetch from instead of 'origin'.
 src_from_branch() {
-  local branch="$1" workdir="$2"
+  local branch="$1" workdir="$2" remote="${3:-}"
   branch="$(norm_branch "$branch")"
-  if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
-    git -C "$REPO_ROOT" fetch -q origin \
-      "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
-  fi
   local ref=""
-  if git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
-    ref="refs/remotes/origin/$branch"
-  elif git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
-    ref="refs/heads/$branch"
+  if [[ -n "$remote" ]]; then
+    # Ad-hoc: fetch straight from a backup repo URL into a scratch tracking ref.
+    git -C "$REPO_ROOT" fetch -q "$remote" \
+      "+refs/heads/$branch:refs/remotes/adhoc/$branch" \
+      || die "could not fetch $branch from $remote"
+    ref="refs/remotes/adhoc/$branch"
   else
-    die "branch not found locally or on origin: $branch"
+    if git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1; then
+      git -C "$REPO_ROOT" fetch -q origin \
+        "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
+    fi
+    if git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+      ref="refs/remotes/origin/$branch"
+    elif git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+      ref="refs/heads/$branch"
+    else
+      die "branch not found locally or on origin: $branch"
+    fi
   fi
   local files
   files="$(git -C "$REPO_ROOT" ls-tree -r --name-only "$ref" -- data/ \
@@ -612,7 +639,7 @@ cmd_restore() {
   local ref="latest"
   local dry=0 yes=0 pick=0 all=0
   local target="/"
-  local from_branch=""
+  local from_branch="" from_remote=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run)   dry=1; shift ;;
@@ -621,6 +648,7 @@ cmd_restore() {
       --all)       all=1; shift ;;
       --branch)    from_branch="$2"; shift 2 ;;
       --mine)      from_branch="$(machine_branch)"; shift ;;
+      --remote)    from_remote="$2"; shift 2 ;;
       --to)        target="$2"; shift 2 ;;
       -*)          die "unknown flag: $1" ;;
       *)           ref="$1"; shift ;;
@@ -630,9 +658,11 @@ cmd_restore() {
   local workdir; workdir="$(mktemp -d -t profilesync.XXXXXX)"
   # shellcheck disable=SC2064
   trap "rm -rf -- '$workdir'" EXIT
+  # --remote implies a branch source; default to this machine's branch.
+  [[ -n "$from_remote" && -z "$from_branch" ]] && from_branch="$(machine_branch)"
   local src
   if [[ -n "$from_branch" ]]; then
-    src="$(src_from_branch "$from_branch" "$workdir")"
+    src="$(src_from_branch "$from_branch" "$workdir" "$from_remote")"
   else
     src="$(resolve_src "$ref" "$workdir")"
   fi
@@ -801,18 +831,19 @@ detect_ssh_key() {  # remote → prints a working key path, or empty
 
 cmd_install() {
   require_root
-  local remote="" ssh_key="" bkuser="${SUDO_USER:-}" repodir="/var/lib/profilesync/repo"
+  local bremote="" ssh_key="" bkuser="${SUDO_USER:-}" repodir="/var/lib/profilesync/repo"
   local schedule="daily" bindst="/usr/local/bin/profilesync"
   local extra=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --remote)    remote="$2"; shift 2 ;;
-      --ssh-key)   ssh_key="$2"; shift 2 ;;
-      --user)      bkuser="$2"; shift 2 ;;
-      --repo-dir)  repodir="$2"; shift 2 ;;
-      --schedule)  schedule="$2"; shift 2 ;;
-      --extra-dir) extra+=("$2"); shift 2 ;;
-      --bin)       bindst="$2"; shift 2 ;;
+      --backup-remote) bremote="$2"; shift 2 ;;
+      --remote)        bremote="$2"; shift 2 ;;   # alias
+      --ssh-key)       ssh_key="$2"; shift 2 ;;
+      --user)          bkuser="$2"; shift 2 ;;
+      --repo-dir)      repodir="$2"; shift 2 ;;
+      --schedule)      schedule="$2"; shift 2 ;;
+      --extra-dir)     extra+=("$2"); shift 2 ;;
+      --bin)           bindst="$2"; shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
   done
@@ -821,43 +852,45 @@ cmd_install() {
   local bkhome; bkhome="$(getent passwd "$bkuser" | cut -d: -f6)"
   [[ -n "$bkhome" ]] || die "no home dir for user: $bkuser"
 
-  # Remote: flag, else this repo's origin, else error.
-  if [[ -z "$remote" ]]; then
-    remote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  # Backup remote: the repo that will HOLD the backups. This is independent of
+  # the tool's source repo. Default (convenience) is this clone's origin, but
+  # any repo on any host works — pass --backup-remote.
+  if [[ -z "$bremote" ]]; then
+    bremote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
   fi
-  [[ -n "$remote" ]] || die "no git remote — pass --remote git@host:org/repo.git"
+  [[ -n "$bremote" ]] || die "no backup remote — pass --backup-remote git@host:org/backups.git"
 
-  # SSH key: flag, else autodetect (test candidates against the remote).
+  # SSH key: flag, else autodetect (test candidates against the backup remote).
   if [[ -z "$ssh_key" ]]; then
-    log "detecting an SSH key that can reach $remote …"
-    ssh_key="$(HOME="$bkhome" detect_ssh_key "$remote")"
-    [[ -n "$ssh_key" ]] || die "no SSH key here can access $remote. Pass --ssh-key <path>, or add a key to the repo as a deploy key (write access)."
+    log "detecting an SSH key that can reach $bremote …"
+    ssh_key="$(HOME="$bkhome" detect_ssh_key "$bremote")"
+    [[ -n "$ssh_key" ]] || die "no SSH key here can access $bremote. Pass --ssh-key <path>, or add a key to that repo as a deploy key (write access)."
   fi
   ssh_key="${ssh_key/#\~/$bkhome}"
   [[ -r "$ssh_key" ]] || die "SSH key not readable: $ssh_key"
 
-  # Pre-flight: the service is unattended, so the key must (a) reach the repo
-  # and (b) have no passphrase.
-  if ! key_works "$ssh_key" "$remote"; then
-    die "SSH key cannot access $remote: $ssh_key
-  → add its public key (${ssh_key}.pub) to the repo as a deploy key with write
+  # Pre-flight: the service is unattended, so the key must (a) reach the backup
+  # repo and (b) have no passphrase.
+  if ! key_works "$ssh_key" "$bremote"; then
+    die "SSH key cannot access $bremote: $ssh_key
+  → add its public key (${ssh_key}.pub) to that repo as a deploy key with write
     access, or pass a different --ssh-key."
   fi
   if key_has_passphrase "$ssh_key"; then
     die "SSH key is passphrase-protected: $ssh_key
   An unattended service cannot unlock it. Use a passphrase-less deploy key
   (e.g. ssh-keygen -t ed25519 -N '' -f ~/.ssh/profilesync_deploy, then add the
-  .pub to the repo's deploy keys) and pass it with --ssh-key."
+  .pub to the backup repo's deploy keys) and pass it with --ssh-key."
   fi
   SSH_KEY="$ssh_key"   # so pass_key() works below
 
   case "$schedule" in daily|hourly|weekly) ;; *) die "schedule must be daily|hourly|weekly" ;; esac
 
-  log "backup user : $bkuser ($bkhome)"
-  log "git remote  : $remote"
-  log "ssh key     : $ssh_key (verified)"
-  log "repo dir    : $repodir"
-  log "schedule    : $schedule"
+  log "backup user  : $bkuser ($bkhome)"
+  log "backup remote: $bremote"
+  log "ssh key      : $ssh_key (verified)"
+  log "repo dir     : $repodir"
+  log "schedule     : $schedule"
 
   # Passphrase: env or prompt (confirmed), then encrypt with the SSH key.
   local plain
@@ -872,19 +905,39 @@ cmd_install() {
   [[ -n "$plain" ]] || die "empty passphrase"
   local enc; enc="$(printf '%s' "$plain" | encrypt_passphrase)"
 
-  # Clone the repo (main) into repodir as the service's working copy.
+  # Set up the service's working git repo whose origin is the BACKUP repo.
+  # We don't require the backup repo to have a 'main' (it may hold only
+  # backup/* branches), so init + add remote rather than clone a branch.
   if [[ ! -d "$repodir/.git" ]]; then
-    mkdir -p "$(dirname "$repodir")"
-    log "cloning $remote → $repodir"
+    mkdir -p "$repodir"
+    log "initializing backup work repo at $repodir → $bremote"
+    git -C "$repodir" init -q
+    git -C "$repodir" remote add origin "$bremote"
     GIT_SSH_COMMAND="$(ssh_cmd_for "$ssh_key")" \
-      git clone --branch main "$remote" "$repodir"
+      git -C "$repodir" fetch -q origin 2>/dev/null || true
   else
-    log "repo dir already a clone — leaving as is"
+    log "repo dir already initialized — updating origin"
+    git -C "$repodir" remote set-url origin "$bremote" 2>/dev/null \
+      || git -C "$repodir" remote add origin "$bremote"
   fi
+  mkdir -p "$repodir/data"
 
   # Install the binary.
   install -m 0755 "${BASH_SOURCE[0]}" "$bindst"
   log "installed binary → $bindst"
+
+  # Seed system path lists so the service doesn't depend on the backup repo's
+  # contents. Prefer the user's existing config, else the tool's examples.
+  mkdir -p "$SYS_CONF_DIR"
+  local src_paths="" src_excl=""
+  if   [[ -f "$bkhome/.config/profilesync/paths.conf" ]]; then src_paths="$bkhome/.config/profilesync/paths.conf"
+  elif [[ -f "$REPO_CONF" ]]; then src_paths="$REPO_CONF"
+  elif [[ -f "$REPO_CONF_EXAMPLE" ]]; then src_paths="$REPO_CONF_EXAMPLE"; fi
+  if   [[ -f "$bkhome/.config/profilesync/excludes.conf" ]]; then src_excl="$bkhome/.config/profilesync/excludes.conf"
+  elif [[ -f "$REPO_EXCLUDES" ]]; then src_excl="$REPO_EXCLUDES"
+  elif [[ -f "$REPO_EXCLUDES_EXAMPLE" ]]; then src_excl="$REPO_EXCLUDES_EXAMPLE"; fi
+  if [[ -n "$src_paths" && ! -f "$SYS_CONF" ]]; then cp -- "$src_paths" "$SYS_CONF"; log "seeded $SYS_CONF (from $(basename "$src_paths"))"; fi
+  if [[ -n "$src_excl"  && ! -f "$SYS_EXCLUDES" ]]; then cp -- "$src_excl" "$SYS_EXCLUDES"; log "seeded $SYS_EXCLUDES"; fi
 
   # Write /etc/profilesync.conf (0600).
   local extra_str=""
@@ -894,7 +947,8 @@ cmd_install() {
 # profilesync machine config — managed by 'profilesync install'
 # Sourced by the tool; KEY="VALUE" shell syntax.
 
-GIT_REMOTE="$remote"
+# Repository that HOLDS the backups (independent of the tool's source repo).
+BACKUP_REMOTE="$bremote"
 SSH_KEY="$ssh_key"
 REPO_DIR="$repodir"
 BACKUP_USER="$bkuser"
@@ -906,6 +960,8 @@ PASSPHRASE_ENC="$enc"
 
 # Extra absolute paths to back up (space or colon separated).
 EXTRA_DIRS="$extra_str"
+
+# Path lists for the service live in $SYS_CONF_DIR/{paths,excludes}.conf
 EOF
   chmod 0600 "$CONF_FILE"
   log "wrote $CONF_FILE (0600)"
@@ -959,10 +1015,11 @@ cmd_uninstall() {
   log "removed systemd units"
   if (( purge )); then
     rm -f "$CONF_FILE"
+    rm -rf "$SYS_CONF_DIR"
     [[ -n "${REPO_DIR:-}" ]] && rm -rf "$REPO_DIR"
-    log "purged $CONF_FILE and ${REPO_DIR:-repo dir}"
+    log "purged $CONF_FILE, $SYS_CONF_DIR and ${REPO_DIR:-repo dir}"
   else
-    log "kept $CONF_FILE and repo dir (use --purge to remove)"
+    log "kept $CONF_FILE, $SYS_CONF_DIR and repo dir (use --purge to remove)"
   fi
 }
 

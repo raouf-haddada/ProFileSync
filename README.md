@@ -12,13 +12,15 @@ Encrypted, git-backed sync of your shell config, `/etc` files, scripts, and keys
 
 ## Layout
 
-| Branch | Contents |
+| Repo / branch | Contents |
 | --- | --- |
-| `main` | `bin/profilesync`, `config/*.example`, `README.md` |
-| `backup/<host>-<id>` | that machine's latest encrypted archive (in `data/`) |
+| tool repo · `main` | `bin/profilesync`, `config/*.example`, `README.md` |
+| backup repo · `backup/<host>-<id>` | that machine's latest encrypted archive (in `data/`) |
 
-The machine id comes from `/etc/machine-id`, so a branch stays tied to the machine
-even if its hostname changes.
+The **backup repo can be the same repo** (backups on `backup/*` branches alongside
+`main`) **or a completely separate repo** on any host — set it with
+`--backup-remote` at install time. The machine id comes from `/etc/machine-id`, so
+a branch stays tied to the machine even if its hostname changes.
 
 ## Setup
 
@@ -55,6 +57,10 @@ git clone git@github.com:raouf-haddada/ProFileSync.git && cd ProFileSync
 
 - `--branch <name>` pulls the latest archive straight from that machine's branch
   (no checkout needed). `<name>` may omit the `backup/` prefix.
+- `--remote <url>` fetches from an arbitrary **backup repo** (handy when the
+  backups live in a different repo than the tool, and you've only cloned the
+  tool). Defaults the branch to this machine's if `--branch` is omitted, e.g.:
+  `profilesync restore --remote git@host:org/backups.git --branch ubuntu-2f6a3d1349f9`
 - `--mine` restores from the current machine's own branch.
 - `--pick` opens a `whiptail` checklist to choose exactly what to restore
   (default when run in a terminal). `--all` restores everything.
@@ -69,23 +75,32 @@ Install a systemd timer that backs up unattended. Run as root:
 
 ```sh
 sudo ./bin/profilesync install \
-  --remote git@github.com:raouf-haddada/ProFileSync.git \
+  --backup-remote git@github.com:raouf-haddada/profilesync-backups.git \
   --user raouf \
   --schedule daily \
   --extra-dir /home/raouf/workspace/env-vars
 # prompts once for the backup passphrase (or set PROFILESYNC_PASSPHRASE)
 ```
 
-This:
+The **backup repo** (`--backup-remote`) is where encrypted archives are pushed
+as `backup/*` branches. It is **independent of this tool's source repo** — point
+it at any repo on any host (a private backups repo is recommended). If omitted,
+it defaults to the current clone's `origin`.
 
-1. Clones the repo to `--repo-dir` (default `/var/lib/profilesync/repo`).
+`install`:
+
+1. Initializes a local work repo at `--repo-dir` (default
+   `/var/lib/profilesync/repo`) with `origin` = the backup remote.
 2. Installs the binary to `/usr/local/bin/profilesync`.
-3. Writes `/etc/profilesync.conf` (mode 0600) — see
+3. Seeds `/etc/profilesync.d/{paths,excludes}.conf` (from your `~/.config`
+   config if present, else the bundled examples) so the service's path list
+   does not depend on the backup repo's contents.
+4. Writes `/etc/profilesync.conf` (mode 0600) — see
    [`config/profilesync.conf.example`](config/profilesync.conf.example).
-4. Installs + enables `profilesync-backup.timer` (`daily` / `hourly` / `weekly`).
+5. Installs + enables `profilesync-backup.timer` (`daily` / `hourly` / `weekly`).
 
-The config persists the **git remote**, **SSH key**, **extra dirs**, the backup
-**user**, and the **passphrase** — and the passphrase is stored encrypted.
+The config persists the **backup remote**, **SSH key**, **extra dirs**, the
+backup **user**, and the **passphrase** (stored encrypted).
 
 ### How the passphrase is protected
 
@@ -119,8 +134,8 @@ sudo profilesync uninstall [--purge]              # remove timer (+ conf & repo)
 | `backup [--push] [-m msg]` | Encrypt + commit to this machine's branch |
 | `list` | List local archives in `data/` |
 | `branches` | List `backup/*` branches on origin |
-| `restore [REF] [--branch n\|--mine] [--pick\|--all] [--dry-run] [--to dir] [--yes]` | Decrypt + restore |
-| `install [--remote URL] [--user N] [--ssh-key P] [--schedule S] [--extra-dir D] [--repo-dir D]` | Set up the autobackup systemd timer (root) |
+| `restore [REF] [--branch n\|--mine\|--remote url] [--pick\|--all] [--dry-run] [--to dir] [--yes]` | Decrypt + restore |
+| `install [--backup-remote URL] [--user N] [--ssh-key P] [--schedule S] [--extra-dir D] [--repo-dir D]` | Set up the autobackup systemd timer (root) |
 | `uninstall [--purge]` | Remove the timer/units (+ conf & repo with `--purge`) |
 | `set-passphrase` | Re-encrypt the backup passphrase into the conf (root) |
 | `show-config` | Print `/etc/profilesync.conf` (passphrase masked) |

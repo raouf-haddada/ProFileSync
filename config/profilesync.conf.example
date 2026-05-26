@@ -3,13 +3,15 @@
 # Keep mode 0600, root-owned. This file may be recreated by hand on a new
 # machine to enable unattended restore.
 
-# Git remote holding the backups (per-machine branches live here).
-GIT_REMOTE="git@github.com:raouf-haddada/ProFileSync.git"
+# Repository that HOLDS the backups (per-machine branches live here). This can
+# be a DIFFERENT repo than the tool's source repo, on any host.
+BACKUP_REMOTE="git@github.com:raouf-haddada/profilesync-backups.git"
 
-# SSH private key used BOTH to reach the repo AND to unlock the passphrase.
+# SSH private key used BOTH to reach the backup repo AND to unlock the
+# passphrase. For an unattended service it must be passphrase-less.
 SSH_KEY="/home/raouf/.ssh/id_ed25519"
 
-# Working clone the service operates on.
+# Local git work repo the service stages/pushes backups from (origin = BACKUP_REMOTE).
 REPO_DIR="/var/lib/profilesync/repo"
 
 # Whose $HOME/$USER the path list expands to (a root service backs this user up).
