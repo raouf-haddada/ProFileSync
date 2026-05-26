@@ -764,18 +764,38 @@ require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "this command must be run as root (try: sudo $0 $SUBCMD ...)"
 }
 
-# Detect the SSH private key used for a git remote host (best effort).
-detect_ssh_key() {
-  local remote="$1" host key
+ssh_cmd_for() {  # key → a GIT_SSH_COMMAND value
+  printf 'ssh -i %s -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new' "$1"
+}
+
+# Can this key actually reach the repo? (Real check: list-remote, any host.)
+key_works() {  # key remote
+  GIT_SSH_COMMAND="$(ssh_cmd_for "$1")" git ls-remote "$2" >/dev/null 2>&1
+}
+
+# 0 (true) if the key is passphrase-protected (bad for an unattended service).
+key_has_passphrase() {  # key
+  ! ssh-keygen -y -P '' -f "$1" >/dev/null 2>&1
+}
+
+# Find a private key that can reach the remote: test ssh -G candidates plus
+# ~/.ssh/id_* (and root's), returning the first that authenticates.
+detect_ssh_key() {  # remote → prints a working key path, or empty
+  local remote="$1" host f g key seen=""
   host="$(printf '%s' "$remote" | sed -n 's/.*@\([^:/]*\).*/\1/p')"
   [[ -z "$host" ]] && host=github.com
-  key="$(ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2; exit}')"
-  # ssh -G prints ~-relative; expand.
-  key="${key/#\~/$HOME}"
-  if [[ -n "$key" && -r "$key" ]]; then printf '%s' "$key"; return; fi
-  local k
-  for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" /root/.ssh/id_ed25519 /root/.ssh/id_rsa; do
-    [[ -r "$k" ]] && { printf '%s' "$k"; return; }
+  local cands=()
+  while IFS= read -r f; do
+    f="${f/#\~/$HOME}"
+    [[ -r "$f" ]] && cands+=("$f")
+  done < <(ssh -G "$host" 2>/dev/null | awk '/^identityfile /{print $2}')
+  for g in "$HOME"/.ssh/id_* /root/.ssh/id_*; do
+    [[ -r "$g" && "$g" != *.pub ]] && cands+=("$g")
+  done
+  for key in "${cands[@]}"; do
+    case " $seen " in *" $key "*) continue ;; esac
+    seen="$seen $key"
+    if key_works "$key" "$remote"; then printf '%s' "$key"; return; fi
   done
 }
 
@@ -807,18 +827,35 @@ cmd_install() {
   fi
   [[ -n "$remote" ]] || die "no git remote — pass --remote git@host:org/repo.git"
 
-  # SSH key: flag, else autodetect for the remote host (search as $bkuser).
+  # SSH key: flag, else autodetect (test candidates against the remote).
   if [[ -z "$ssh_key" ]]; then
+    log "detecting an SSH key that can reach $remote …"
     ssh_key="$(HOME="$bkhome" detect_ssh_key "$remote")"
+    [[ -n "$ssh_key" ]] || die "no SSH key here can access $remote. Pass --ssh-key <path>, or add a key to the repo as a deploy key (write access)."
   fi
-  [[ -n "$ssh_key" && -r "$ssh_key" ]] || die "SSH key not found/readable — pass --ssh-key <path>"
+  ssh_key="${ssh_key/#\~/$bkhome}"
+  [[ -r "$ssh_key" ]] || die "SSH key not readable: $ssh_key"
+
+  # Pre-flight: the service is unattended, so the key must (a) reach the repo
+  # and (b) have no passphrase.
+  if ! key_works "$ssh_key" "$remote"; then
+    die "SSH key cannot access $remote: $ssh_key
+  → add its public key (${ssh_key}.pub) to the repo as a deploy key with write
+    access, or pass a different --ssh-key."
+  fi
+  if key_has_passphrase "$ssh_key"; then
+    die "SSH key is passphrase-protected: $ssh_key
+  An unattended service cannot unlock it. Use a passphrase-less deploy key
+  (e.g. ssh-keygen -t ed25519 -N '' -f ~/.ssh/profilesync_deploy, then add the
+  .pub to the repo's deploy keys) and pass it with --ssh-key."
+  fi
   SSH_KEY="$ssh_key"   # so pass_key() works below
 
   case "$schedule" in daily|hourly|weekly) ;; *) die "schedule must be daily|hourly|weekly" ;; esac
 
   log "backup user : $bkuser ($bkhome)"
   log "git remote  : $remote"
-  log "ssh key     : $ssh_key"
+  log "ssh key     : $ssh_key (verified)"
   log "repo dir    : $repodir"
   log "schedule    : $schedule"
 
@@ -839,7 +876,7 @@ cmd_install() {
   if [[ ! -d "$repodir/.git" ]]; then
     mkdir -p "$(dirname "$repodir")"
     log "cloning $remote → $repodir"
-    GIT_SSH_COMMAND="ssh -i $ssh_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
+    GIT_SSH_COMMAND="$(ssh_cmd_for "$ssh_key")" \
       git clone --branch main "$remote" "$repodir"
   else
     log "repo dir already a clone — leaving as is"
