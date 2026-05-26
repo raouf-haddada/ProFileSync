@@ -22,6 +22,42 @@ The **backup repo can be the same repo** (backups on `backup/*` branches alongsi
 `--backup-remote` at install time. The machine id comes from `/etc/machine-id`, so
 a branch stays tied to the machine even if its hostname changes.
 
+## One command (bootstrap)
+
+[`bootstrap.sh`](bootstrap.sh) clones the tool and runs a subcommand in a single
+shot — everything after `--` is passed straight to `profilesync`.
+
+**Install the autobackup service** (root):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raouf-haddada/ProFileSync/main/bootstrap.sh \
+  | sudo bash -s -- install \
+      --backup-remote git@github.com:raouf-haddada/profilesync-backups.git \
+      --user "$USER" --schedule daily
+```
+
+**Restore on a fresh machine** (pull from the backup repo, pick what to restore):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/raouf-haddada/ProFileSync/main/bootstrap.sh \
+  | bash -s -- restore \
+      --remote git@github.com:raouf-haddada/profilesync-backups.git \
+      --branch ubuntu-2f6a3d1349f9 --pick
+```
+
+Prompts (passphrase, confirmation, the `--pick` checklist) read from your
+terminal, so they work even through the pipe.
+
+The `curl | …` form needs the **tool repo to be public** (raw URL). If it's
+private, clone-and-run is equivalent and works with your SSH key:
+
+```sh
+git clone git@github.com:raouf-haddada/ProFileSync.git /tmp/pfs \
+  && sudo /tmp/pfs/bin/profilesync install --backup-remote <url> --user "$USER"
+```
+
+Override the tool source with `PROFILESYNC_TOOL_REMOTE` / `PROFILESYNC_TOOL_REF`.
+
 ## Setup
 
 ```sh
