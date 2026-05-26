@@ -800,6 +800,29 @@ ssh_cmd_for() {  # key → a GIT_SSH_COMMAND value
   printf 'ssh -i %s -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new' "$1"
 }
 
+remote_host() {  # git remote → host
+  printf '%s' "$1" | sed -n 's/.*@\([^:/]*\).*/\1/p'
+}
+
+# Make the current ($HOME) known_hosts trust the remote host using the key the
+# backup user already trusts. accept-new handles unknown hosts but REFUSES a
+# changed key — so under sudo a stale /root entry blocks every key. Importing
+# the user's verified entry (and dropping a conflicting one) fixes that without
+# blindly trusting a new key.
+ensure_known_host() {  # remote bkhome
+  local host; host="$(remote_host "$1")"; [[ -z "$host" ]] && return 0
+  local bkhome="$2" ukh="$2/.ssh/known_hosts" rkh="$HOME/.ssh/known_hosts"
+  [[ -r "$ukh" ]] || return 0
+  ssh-keygen -F "$host" -f "$ukh" >/dev/null 2>&1 || return 0   # user doesn't know host
+  [[ "$ukh" -ef "$rkh" ]] && return 0                            # same file → nothing to do
+  mkdir -p "$(dirname "$rkh")"; touch "$rkh"
+  if ssh-keygen -F "$host" -f "$rkh" >/dev/null 2>&1; then
+    ssh-keygen -R "$host" -f "$rkh" >/dev/null 2>&1 || true      # drop any (possibly stale) entry
+  fi
+  ssh-keygen -F "$host" -f "$ukh" | grep -v '^#' >> "$rkh"
+  log "trusted $host host key (imported from ${bkhome}/.ssh/known_hosts)"
+}
+
 # Can this key actually reach the repo? (Real check: list-remote, any host.)
 key_works() {  # key remote
   GIT_SSH_COMMAND="$(ssh_cmd_for "$1")" git ls-remote "$2" >/dev/null 2>&1
@@ -942,6 +965,10 @@ cmd_install() {
     bremote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
   fi
   [[ -n "$bremote" ]] || die "no backup remote — pass --backup-remote git@host:org/backups.git"
+
+  # Make sure root trusts the backup host's key (avoids "HOST IDENTIFICATION
+  # CHANGED" from a stale /root/.ssh/known_hosts blocking every SSH key).
+  ensure_known_host "$bremote" "$bkhome"
 
   # Explicit deploy-key generation: make one, show its pubkey, stop so the user
   # can authorize it on the backup repo, then re-run.
