@@ -35,6 +35,8 @@
 #                         --repo-dir DIR   service work repo (/var/lib/profilesync/repo)
 #                         --schedule S     daily|hourly|weekly (default: daily)
 #                         --extra-dir DIR  extra path to back up (repeatable)
+#                         --git-name NAME  commit author name for backups
+#                         --git-email ADDR commit author email for backups
 #                         --generate-deploy-key  make a passphrase-less deploy key,
 #                                          print its .pub to authorize, then stop
 #   uninstall [--purge] Remove the timer/units (+ conf, sysconf & repo w/ --purge).
@@ -46,7 +48,8 @@
 # different hosts.
 #
 # Machine config (/etc/profilesync.conf, sourced if present):
-#   BACKUP_REMOTE, SSH_KEY, REPO_DIR, BACKUP_USER, BRANCH, EXTRA_DIRS, PASSPHRASE_ENC
+#   BACKUP_REMOTE, SSH_KEY, REPO_DIR, BACKUP_USER, BRANCH, EXTRA_DIRS,
+#   GIT_NAME, GIT_EMAIL, PASSPHRASE_ENC
 #   The passphrase is encrypted with AES-256 keyed on sha256(SSH_KEY file), so
 #   the same SSH key that reaches the backup repo also unlocks the passphrase.
 #   The service decrypts it unattended; restore on another machine with the same
@@ -241,8 +244,10 @@ commit_to_branch() {
   (
     export GIT_INDEX_FILE="$tmpindex"
     # Explicit identity so commits work even with no gitconfig (root service).
-    export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-profilesync}"
-    export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-profilesync@$(hostname -s)}"
+    # GIT_NAME/GIT_EMAIL (from /etc/profilesync.conf) let backups be authored
+    # with the right per-host identity; fall back to a generic value.
+    export GIT_AUTHOR_NAME="${GIT_NAME:-${GIT_AUTHOR_NAME:-profilesync}}"
+    export GIT_AUTHOR_EMAIL="${GIT_EMAIL:-${GIT_AUTHOR_EMAIL:-profilesync@$(hostname -s)}}"
     export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
     export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
     cd "$REPO_ROOT"
@@ -938,7 +943,7 @@ cmd_install() {
   require_root
   local bremote="" ssh_key="" bkuser="${SUDO_USER:-}" repodir="/var/lib/profilesync/repo"
   local schedule="daily" bindst="/usr/local/bin/profilesync"
-  local extra=() gen_key=0
+  local extra=() gen_key=0 gitname="" gitemail=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --backup-remote) bremote="$2"; shift 2 ;;
@@ -948,6 +953,8 @@ cmd_install() {
       --repo-dir)      repodir="$2"; shift 2 ;;
       --schedule)      schedule="$2"; shift 2 ;;
       --extra-dir)     extra+=("$2"); shift 2 ;;
+      --git-name)      gitname="$2"; shift 2 ;;
+      --git-email)     gitemail="$2"; shift 2 ;;
       --generate-deploy-key) gen_key=1; shift ;;
       --bin)           bindst="$2"; shift 2 ;;
       *) die "unknown flag: $1" ;;
@@ -1016,6 +1023,8 @@ cmd_install() {
   log "ssh key      : $ssh_key (verified)"
   log "repo dir     : $repodir"
   log "schedule     : $schedule"
+  [[ -n "$gitemail" ]] && log "commit email : $gitname <$gitemail>" \
+    || warn "no --git-email given; backup commits use git config / profilesync@host"
 
   # Passphrase: env or prompt (confirmed), then encrypt with the SSH key.
   local plain
@@ -1078,6 +1087,11 @@ SSH_KEY="$ssh_key"
 REPO_DIR="$repodir"
 BACKUP_USER="$bkuser"
 BRANCH=""                       # empty → backup/<host>-<machine-id>
+
+# Commit identity for backups (per-host; e.g. a GitHub noreply, or a GitLab
+# address). Empty → falls back to the user's git config, then profilesync@host.
+GIT_NAME="$gitname"
+GIT_EMAIL="$gitemail"
 
 # Passphrase encrypted with AES-256 keyed on sha256("\$SSH_KEY").
 # Re-encode with: profilesync set-passphrase

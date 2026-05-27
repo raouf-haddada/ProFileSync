@@ -20,6 +20,11 @@ BACKUP_USER="raouf"
 # Optional branch override. Empty → backup/<hostname>-<machine-id>.
 BRANCH=""
 
+# Commit identity for backups (set per host, e.g. a GitHub noreply or a GitLab
+# address). Empty → falls back to the user's git config, then profilesync@<host>.
+GIT_NAME="Raouf HADDADA"
+GIT_EMAIL=""
+
 # Backup passphrase, AES-256 encrypted with a key derived from sha256(SSH_KEY).
 # Anyone with the same SSH key (i.e. repo access) can decrypt it; the file
 # alone cannot. (Re)generate with: profilesync set-passphrase
